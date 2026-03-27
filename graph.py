@@ -45,7 +45,7 @@ def route_after_critic(state: SchedulerState):
     critique = state.get("critique", "")
     revision_count = state.get("revision_count", 0)
 
-    if "PERFECT" in critique.upper() or revision_count >= 3:
+    if "PERFECT" in critique.upper() or revision_count >= 7:
         return "human_review"
     return "scheduler"
 
@@ -141,7 +141,7 @@ if __name__ == "__main__":
         print("  YOUR PROPOSED SCHEDULE")
         print(f"{'=' * 50}")
         print(schedule)
-        print(f"\n  (Revisions used: {revisions} of 3)")
+        print(f"\n  (Revisions used: {revisions} of 7)")
 
         feedback = input(
             "\nType 'approve' to accept, or describe your tweaks:\n> "
@@ -190,7 +190,7 @@ if __name__ == "__main__":
         print("  REVISED SCHEDULE")
         print(f"{'=' * 50}")
         print(schedule)
-        print(f"\n  (Revisions used: {revisions} of 3)")
+        print(f"\n  (Revisions used: {revisions} of 7)")
 
         feedback = input(
             "\nType 'approve' to accept, or describe more tweaks:\n> "

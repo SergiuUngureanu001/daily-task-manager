@@ -477,7 +477,7 @@ elif st.session_state.phase == "review":
     </div>
     """, unsafe_allow_html=True)
 
-    st.info(f"Revisions used: {revisions} of 3")
+    st.info(f"Revisions used: {revisions} of 7")
 
     col1, col2 = st.columns([1, 2])
 

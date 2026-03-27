@@ -531,7 +531,7 @@ Evaluate against these criteria:
 4. Is there realistic buffer and travel time between tasks?
 5. Does the schedule start from the current time, not a generic morning?
 
-This is revision {revision_count} of 3.
+This is revision {revision_count} of 7.
 
 If the schedule meets ALL criteria, reply with EXACTLY the word: PERFECT
 Otherwise, provide a concise bulleted list of specific changes needed."""
