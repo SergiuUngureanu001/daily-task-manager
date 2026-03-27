@@ -477,12 +477,12 @@ elif st.session_state.phase == "review":
     </div>
     """, unsafe_allow_html=True)
 
-    max_revisions = 7
-    st.info(f"Revisions used: {revisions} of {max_revisions}")
+    st.info(f"Auto-revisions used: {revisions} of 7 (your tweaks are always allowed)")
 
-    if revisions >= max_revisions:
-        st.warning("Maximum revisions reached. Please approve the schedule.")
-        if st.button("Approve Schedule", type="primary"):
+    col1, col2 = st.columns([1, 2])
+
+    with col1:
+        if st.button("Approve Schedule", type="primary", use_container_width=True):
             success = run_graph_streaming(
                 Command(resume="approved"), config, is_resume=True
             )
@@ -490,36 +490,24 @@ elif st.session_state.phase == "review":
                 snap = graph_app.get_state(config)
                 st.session_state.phase = "review" if snap.next else "done"
                 st.rerun()
-    else:
-        col1, col2 = st.columns([1, 2])
 
-        with col1:
-            if st.button("Approve Schedule", type="primary", use_container_width=True):
-                success = run_graph_streaming(
-                    Command(resume="approved"), config, is_resume=True
-                )
-                if success:
-                    snap = graph_app.get_state(config)
-                    st.session_state.phase = "review" if snap.next else "done"
-                    st.rerun()
-
-        with col2:
-            tweaks = st.text_input(
-                "Describe your tweaks:",
-                placeholder="e.g. Move gym to morning, add lunch break",
+    with col2:
+        tweaks = st.text_input(
+            "Describe your tweaks:",
+            placeholder="e.g. Remove the 65-min buffer, schedule groceries at 22:55",
+        )
+        if st.button("Submit Tweaks", use_container_width=True) and tweaks:
+            st.session_state.timeline.append({
+                "type": "tweak",
+                "content": tweaks,
+            })
+            success = run_graph_streaming(
+                Command(resume=tweaks), config, is_resume=True
             )
-            if st.button("Submit Tweaks", use_container_width=True) and tweaks:
-                st.session_state.timeline.append({
-                    "type": "tweak",
-                    "content": tweaks,
-                })
-                success = run_graph_streaming(
-                    Command(resume=tweaks), config, is_resume=True
-                )
-                if success:
-                    snap = graph_app.get_state(config)
-                    st.session_state.phase = "review" if snap.next else "done"
-                    st.rerun()
+            if success:
+                snap = graph_app.get_state(config)
+                st.session_state.phase = "review" if snap.next else "done"
+                st.rerun()
 
 
 # ===========================================================================
