@@ -18,6 +18,9 @@ class SchedulerState(TypedDict):
     # The user's current location / home base (e.g. "123 Main St, Austin, TX")
     user_location: str
 
+    # IANA timezone derived from user_location (e.g. "Europe/Bucharest")
+    user_timezone: str
+
     # Text extracted from uploaded documents (images, PDFs, .txt files)
     uploaded_files_text: str
 

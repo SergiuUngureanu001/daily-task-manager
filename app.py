@@ -5,12 +5,13 @@ Run with:  streamlit run app.py
 
 import sqlite3
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 from langgraph.types import Command
 
 from graph import build_graph, DB_PATH
-from nodes import process_uploaded_file
+from nodes import process_uploaded_file, resolve_timezone
 
 # ---------------------------------------------------------------------------
 # Page config (must be first Streamlit call)
@@ -56,6 +57,8 @@ if "thread_id" not in st.session_state:
     st.session_state.thread_id = f"web-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 if "location" not in st.session_state:
     st.session_state.location = "Home"
+if "user_timezone" not in st.session_state:
+    st.session_state.user_timezone = "UTC"
 if "timeline" not in st.session_state:
     st.session_state.timeline = []  # [{type: "schedule"/"tweak", content: "..."}]
 
@@ -67,6 +70,7 @@ def get_config():
 def new_session():
     st.session_state.phase = "input"
     st.session_state.thread_id = f"web-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    st.session_state.user_timezone = "UTC"
     st.session_state.timeline = []
 
 
@@ -97,7 +101,12 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 st.title("AI Daily Schedule Optimizer")
-st.caption(f"Today is {datetime.now().strftime('%A, %B %d, %Y at %H:%M')}")
+try:
+    _display_tz = ZoneInfo(st.session_state.user_timezone)
+except Exception:
+    _display_tz = ZoneInfo("UTC")
+_display_now = datetime.now(tz=_display_tz).strftime("%A, %B %d, %Y at %H:%M")
+st.caption(f"Today is {_display_now} ({st.session_state.user_timezone})")
 
 
 # ---------------------------------------------------------------------------
@@ -163,10 +172,17 @@ if st.session_state.phase == "input":
                         st.write(f"  {f.name} failed: {e}")
                 fstatus.update(label="Files processed!", state="complete")
 
-        # ---- Step 2: invoke the graph ----
+        # ---- Step 2: resolve timezone from location ----
+        with st.status("Detecting timezone from your location...") as tz_status:
+            user_tz = resolve_timezone(st.session_state.location)
+            st.session_state.user_timezone = user_tz
+            tz_status.update(label=f"Timezone: {user_tz}", state="complete")
+
+        # ---- Step 3: invoke the graph ----
         initial_state = {
             "raw_tasks": raw_tasks or "See uploaded documents below.",
             "user_location": st.session_state.location,
+            "user_timezone": user_tz,
             "uploaded_files_text": extracted_text,
         }
 

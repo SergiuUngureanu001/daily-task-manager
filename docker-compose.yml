@@ -10,7 +10,6 @@ services:
       # Persist the SQLite database across container restarts
       - db_data:/app/data
     environment:
-      - TZ=Europe/Bucharest
       - STREAMLIT_SERVER_MAX_UPLOAD_SIZE=10
     restart: unless-stopped
 

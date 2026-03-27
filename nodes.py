@@ -4,6 +4,7 @@ import json
 import os
 import requests
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
@@ -46,6 +47,43 @@ def extract_text(content) -> str:
                 parts.append(block)
         return "\n".join(parts)
     return str(content)
+
+
+# ---------------------------------------------------------------------------
+# Timezone resolution — derives IANA timezone from a location name
+# ---------------------------------------------------------------------------
+
+def resolve_timezone(location: str) -> str:
+    """
+    Geocode a location via Open-Meteo and return its IANA timezone
+    (e.g. 'Europe/Bucharest'). Falls back to UTC on failure.
+    """
+    for query in [location, location.split(",")[0].strip()]:
+        try:
+            url = (
+                "https://geocoding-api.open-meteo.com/v1/search"
+                f"?name={requests.utils.quote(query)}&count=1"
+            )
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+            if results and "timezone" in results[0]:
+                tz = results[0]["timezone"]
+                ZoneInfo(tz)  # validate it
+                return tz
+        except Exception:
+            continue
+    return "UTC"
+
+
+def _now(state) -> str:
+    """Return the current time formatted for prompts, using the user's timezone."""
+    tz_name = state.get("user_timezone", "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    return datetime.now(tz=tz).strftime("%A, %B %d, %Y at %H:%M")
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +317,7 @@ def task_ingester(state: SchedulerState):
     """
     print("\n--- INGESTING TASKS ---")
     raw_tasks = state.get("raw_tasks", "No tasks provided.")
-    now = datetime.now().strftime("%A, %B %d, %Y at %H:%M")
+    now = _now(state)
 
     prompt = f"""You are an expert task analyzer. The current date and time is: {now}
 
@@ -350,7 +388,7 @@ def scheduler(state: SchedulerState):
     parsed_tasks = state.get("parsed_tasks", [])
     critique = state.get("critique", "")
     user_location = state.get("user_location", "Home")
-    now = datetime.now().strftime("%A, %B %d, %Y at %H:%M")
+    now = _now(state)
 
     critique_section = critique if critique else "None — this is the first draft."
 
@@ -403,7 +441,7 @@ def critic(state: SchedulerState):
     draft_schedule = state.get("draft_schedule", "")
     parsed_tasks = state.get("parsed_tasks", [])
     revision_count = state.get("revision_count", 0)
-    now = datetime.now().strftime("%A, %B %d, %Y at %H:%M")
+    now = _now(state)
 
     prompt = f"""You are a strict productivity critic. The current time is: {now}
 

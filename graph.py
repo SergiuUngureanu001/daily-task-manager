@@ -14,6 +14,7 @@ from nodes import (
     critic,
     human_review,
     tool_node,
+    resolve_timezone,
 )
 
 
@@ -164,9 +165,17 @@ if __name__ == "__main__":
             print("No tasks provided. Exiting.")
             exit()
 
+        print("\nResolving timezone...")
+        user_tz = resolve_timezone(user_location)
+        print(f"  Timezone: {user_tz}")
+
         print("\nThinking...\n")
         result = app.invoke(
-            {"raw_tasks": user_input, "user_location": user_location},
+            {
+                "raw_tasks": user_input,
+                "user_location": user_location,
+                "user_timezone": user_tz,
+            },
             config,
         )
 
