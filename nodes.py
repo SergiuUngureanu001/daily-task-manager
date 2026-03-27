@@ -374,7 +374,10 @@ def task_ingester(state: SchedulerState):
     raw_tasks = state.get("raw_tasks", "No tasks provided.")
     now = _now(state)
 
+    user_location = state.get("user_location", "Home")
+
     prompt = f"""You are an expert task analyzer. The current date and time is: {now}
+The user is currently located at: {user_location}
 
 Analyze these raw tasks: "{raw_tasks}"
 
@@ -384,8 +387,15 @@ For each task:
 - Note any implied deadlines relative to the current time.
 - Note any locations mentioned (useful for travel/commute planning).
 
+LOCATION DISAMBIGUATION:
+If a task mentions a place name without a full address or city, assume it is
+near the user's current location ({user_location}) and append the city/area.
+For example, if the user is in Bucuresti and says "Mega Image at Alba Iulia",
+output "Mega Image, Piata Alba Iulia, Bucuresti" — NOT the city of Alba Iulia
+in Transylvania. Always resolve ambiguous locations to the nearest local match.
+
 Return ONLY a valid JSON list of objects — no markdown, no code fences:
-[{{"task": "name", "duration": 60, "priority": 1, "deadline": "HH:MM or null", "location": "place or null"}}]"""
+[{{"task": "name", "duration": 60, "priority": 1, "deadline": "HH:MM or null", "location": "full disambiguated address or null"}}]"""
 
     response = llm.invoke([HumanMessage(content=prompt)])
 
