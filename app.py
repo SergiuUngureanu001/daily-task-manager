@@ -56,6 +56,8 @@ if "thread_id" not in st.session_state:
     st.session_state.thread_id = f"web-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 if "location" not in st.session_state:
     st.session_state.location = "Home"
+if "timeline" not in st.session_state:
+    st.session_state.timeline = []  # [{type: "schedule"/"tweak", content: "..."}]
 
 
 def get_config():
@@ -65,6 +67,7 @@ def get_config():
 def new_session():
     st.session_state.phase = "input"
     st.session_state.thread_id = f"web-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    st.session_state.timeline = []
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +180,7 @@ if st.session_state.phase == "input":
 
 
 # ---------------------------------------------------------------------------
-# Phase: REVIEW — human-in-the-loop approval or tweaks
+# Phase: REVIEW — human-in-the-loop approval or tweaks (timeline view)
 # ---------------------------------------------------------------------------
 
 elif st.session_state.phase == "review":
@@ -194,16 +197,47 @@ elif st.session_state.phase == "review":
     critique = values.get("critique", "")
     revisions = values.get("revision_count", 0)
 
-    st.subheader("Proposed Schedule")
-    st.markdown(schedule)
+    # Add current schedule to timeline if it's new
+    if (not st.session_state.timeline
+            or st.session_state.timeline[-1].get("content") != schedule):
+        st.session_state.timeline.append({
+            "type": "schedule",
+            "content": schedule,
+            "critique": critique,
+            "revision": revisions,
+        })
 
-    if critique:
-        with st.expander("Critic's Assessment", expanded=False):
-            st.markdown(critique)
+    # --- Render full timeline ---
+    st.subheader("Schedule Timeline")
+
+    for i, entry in enumerate(st.session_state.timeline):
+        if entry["type"] == "tweak":
+            st.markdown(f"**Your tweak:** {entry['content']}")
+            st.divider()
+
+        elif entry["type"] == "schedule":
+            is_latest = (i == len(st.session_state.timeline) - 1)
+            label = "Latest Schedule" if is_latest else f"Schedule v{entry['revision']}"
+
+            if is_latest:
+                # Show the latest schedule expanded
+                st.markdown(f"**{label}** (revision {entry['revision']} of 3)")
+                st.markdown(entry["content"])
+                if entry.get("critique"):
+                    with st.expander("Critic's Assessment", expanded=False):
+                        st.markdown(entry["critique"])
+            else:
+                # Collapse older schedules
+                with st.expander(label, expanded=False):
+                    st.markdown(entry["content"])
+                    if entry.get("critique"):
+                        st.caption("Critic: " + entry["critique"][:200] + "...")
+
+            st.divider()
 
     st.info(f"Revisions used: {revisions} of 3")
-    st.divider()
 
+    # --- Action buttons ---
     st.subheader("Your Decision")
     col1, col2 = st.columns([1, 2])
 
@@ -223,6 +257,11 @@ elif st.session_state.phase == "review":
             placeholder="e.g. Move gym to morning, add lunch break",
         )
         if st.button("Submit Tweaks", use_container_width=True) and tweaks:
+            # Record the tweak in the timeline before running the graph
+            st.session_state.timeline.append({
+                "type": "tweak",
+                "content": tweaks,
+            })
             success = run_graph_streaming(
                 Command(resume=tweaks), config, is_resume=True
             )
@@ -252,6 +291,19 @@ elif st.session_state.phase == "done":
         f"Schedule complete! Total revisions: "
         f"{final_state.get('revision_count', 0)}"
     )
+
+    # Show previous revisions if any tweaks were made
+    if len(st.session_state.timeline) > 1:
+        st.divider()
+        with st.expander("Revision History", expanded=False):
+            for entry in st.session_state.timeline:
+                if entry["type"] == "tweak":
+                    st.markdown(f"**Your tweak:** {entry['content']}")
+                    st.divider()
+                elif entry["type"] == "schedule":
+                    st.markdown(f"**Schedule v{entry['revision']}**")
+                    st.markdown(entry["content"][:500] + "..." if len(entry["content"]) > 500 else entry["content"])
+                    st.divider()
 
     st.divider()
     if st.button("Plan Another Day", type="primary"):
