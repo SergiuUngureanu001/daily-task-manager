@@ -239,7 +239,7 @@ def render_metrics(schedule_data: list):
     total_min = sum(e.get("duration_min", 0) for e in schedule_data)
     hours, mins = divmod(total_min, 60)
     end_time = schedule_data[-1].get("end", "?")
-    focus = [e for e in schedule_data if e.get("type") in ("work", "call", "errand")]
+    focus = [e for e in schedule_data if e.get("type") not in ("break", "travel", "shower")]
     breaks = [e for e in schedule_data if e.get("type") == "break"]
     weather = next(
         (e["weather"] for e in schedule_data if e.get("weather")),
@@ -477,12 +477,12 @@ elif st.session_state.phase == "review":
     </div>
     """, unsafe_allow_html=True)
 
-    st.info(f"Revisions used: {revisions} of 7")
+    max_revisions = 7
+    st.info(f"Revisions used: {revisions} of {max_revisions}")
 
-    col1, col2 = st.columns([1, 2])
-
-    with col1:
-        if st.button("Approve Schedule", type="primary", use_container_width=True):
+    if revisions >= max_revisions:
+        st.warning("Maximum revisions reached. Please approve the schedule.")
+        if st.button("Approve Schedule", type="primary"):
             success = run_graph_streaming(
                 Command(resume="approved"), config, is_resume=True
             )
@@ -490,24 +490,36 @@ elif st.session_state.phase == "review":
                 snap = graph_app.get_state(config)
                 st.session_state.phase = "review" if snap.next else "done"
                 st.rerun()
+    else:
+        col1, col2 = st.columns([1, 2])
 
-    with col2:
-        tweaks = st.text_input(
-            "Describe your tweaks:",
-            placeholder="e.g. Move gym to morning, add lunch break",
-        )
-        if st.button("Submit Tweaks", use_container_width=True) and tweaks:
-            st.session_state.timeline.append({
-                "type": "tweak",
-                "content": tweaks,
-            })
-            success = run_graph_streaming(
-                Command(resume=tweaks), config, is_resume=True
+        with col1:
+            if st.button("Approve Schedule", type="primary", use_container_width=True):
+                success = run_graph_streaming(
+                    Command(resume="approved"), config, is_resume=True
+                )
+                if success:
+                    snap = graph_app.get_state(config)
+                    st.session_state.phase = "review" if snap.next else "done"
+                    st.rerun()
+
+        with col2:
+            tweaks = st.text_input(
+                "Describe your tweaks:",
+                placeholder="e.g. Move gym to morning, add lunch break",
             )
-            if success:
-                snap = graph_app.get_state(config)
-                st.session_state.phase = "review" if snap.next else "done"
-                st.rerun()
+            if st.button("Submit Tweaks", use_container_width=True) and tweaks:
+                st.session_state.timeline.append({
+                    "type": "tweak",
+                    "content": tweaks,
+                })
+                success = run_graph_streaming(
+                    Command(resume=tweaks), config, is_resume=True
+                )
+                if success:
+                    snap = graph_app.get_state(config)
+                    st.session_state.phase = "review" if snap.next else "done"
+                    st.rerun()
 
 
 # ===========================================================================
