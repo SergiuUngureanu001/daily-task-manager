@@ -87,6 +87,61 @@ def _now(state) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Schedule JSON parsing helpers
+# ---------------------------------------------------------------------------
+
+def _parse_schedule_response(response_content):
+    """
+    Parse the scheduler's LLM response into (structured_list, text_version).
+    Falls back to ([], raw_text) if JSON extraction fails.
+    """
+    raw = extract_text(response_content)
+
+    # Try direct JSON parse (clean response)
+    for attempt in [raw, raw.strip().strip("`").removeprefix("json").strip()]:
+        try:
+            data = json.loads(attempt)
+            if isinstance(data, list):
+                return data, _schedule_to_text(data)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    # Try to extract a JSON array from mixed text
+    try:
+        start = raw.index("[")
+        end = raw.rindex("]") + 1
+        data = json.loads(raw[start:end])
+        if isinstance(data, list):
+            return data, _schedule_to_text(data)
+    except (ValueError, json.JSONDecodeError):
+        pass
+
+    print("  Warning: could not parse schedule JSON, using raw text.")
+    return [], raw
+
+
+def _schedule_to_text(entries):
+    """Convert structured schedule JSON to readable text for the critic."""
+    lines = []
+    for e in entries:
+        p = f" [Priority {e['priority']}]" if e.get("priority") else ""
+        lines.append(
+            f"{e.get('start','?')} - {e.get('end','?')} | "
+            f"{e.get('title','Untitled')}{p} ({e.get('duration_min','?')} min)"
+        )
+        if e.get("location"):
+            lines.append(f"  Location: {e['location']}")
+        if e.get("notes"):
+            lines.append(f"  {e['notes']}")
+        if e.get("weather"):
+            lines.append(f"  Weather: {e['weather']}")
+        if e.get("commute"):
+            lines.append(f"  Commute: {e['commute']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Document processing helpers — called from app.py before graph invocation
 # ---------------------------------------------------------------------------
 
@@ -379,9 +434,13 @@ def scheduler(state: SchedulerState):
     if messages and isinstance(messages[-1], ToolMessage):
         response = llm_with_tools.invoke(messages)
         has_more_tool_calls = bool(getattr(response, "tool_calls", None))
+        if has_more_tool_calls:
+            return {"messages": [response]}
+        structured, text = _parse_schedule_response(response.content)
         return {
             "messages": [response],
-            "draft_schedule": "" if has_more_tool_calls else extract_text(response.content),
+            "draft_schedule": text,
+            "structured_schedule": structured,
         }
 
     # ---- Fresh scheduling attempt ----
@@ -415,15 +474,29 @@ Before generating the schedule, you MUST call the following tools:
 - For ANY outdoor or physical task (gym, sports, walking, park, etc.), call get_weather(location="{user_location}") to check conditions and note them in the schedule.
 Do NOT skip tool calls. Call the tools FIRST, then build the schedule using their results.
 
-Output a clear, timestamped schedule in plain text."""
+OUTPUT FORMAT:
+Return ONLY a valid JSON array — no markdown fences, no text before or after.
+Each element is one scheduled block:
+[{{"start":"HH:MM","end":"HH:MM","title":"Task Name","type":"work|break|travel|fitness|call|errand|meal|shower","priority":1,"duration_min":60,"location":"place or null","notes":"1-line context or null","weather":"brief weather note or null","commute":"travel info or null"}}]
+
+type must be one of: work, break, travel, fitness, call, errand, meal, shower.
+priority is 1-10 for real tasks, null for breaks/travel."""
 
     human_msg = HumanMessage(content=prompt)
     response = llm_with_tools.invoke(messages + [human_msg])
     has_tool_calls = bool(getattr(response, "tool_calls", None))
 
+    if has_tool_calls:
+        return {
+            "messages": [human_msg, response],
+            "revision_count": revision_count + 1,
+        }
+
+    structured, text = _parse_schedule_response(response.content)
     return {
         "messages": [human_msg, response],
-        "draft_schedule": "" if has_tool_calls else extract_text(response.content),
+        "draft_schedule": text,
+        "structured_schedule": structured,
         "revision_count": revision_count + 1,
     }
 

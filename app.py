@@ -3,6 +3,7 @@ Streamlit frontend for the AI Daily Schedule Optimizer.
 Run with:  streamlit run app.py
 """
 
+import html as html_lib
 import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -24,7 +25,88 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Cached graph instance — shared across all Streamlit reruns
+# Global CSS — injected once for card styling
+# ---------------------------------------------------------------------------
+
+st.markdown("""
+<style>
+/* Schedule card */
+.sched-card {
+    border-radius: 0.6rem;
+    padding: 1rem 1.2rem;
+    margin-bottom: 0.7rem;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(250,250,250,0.08);
+}
+.sched-card .card-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+}
+.sched-card .card-title {
+    font-size: 1.15rem;
+    font-weight: 600;
+}
+.sched-card .card-time {
+    color: rgba(250,250,250,0.45);
+    font-size: 0.92rem;
+    font-weight: 500;
+}
+.sched-card .card-meta {
+    display: flex;
+    gap: 1.2rem;
+    color: rgba(250,250,250,0.45);
+    font-size: 0.85rem;
+    margin-top: 0.35rem;
+    flex-wrap: wrap;
+}
+.sched-card .card-notes {
+    color: rgba(250,250,250,0.55);
+    font-size: 0.9rem;
+    margin-top: 0.35rem;
+}
+.sched-card .card-badges {
+    display: flex;
+    gap: 0.45rem;
+    margin-top: 0.5rem;
+    flex-wrap: wrap;
+}
+.pri-badge {
+    padding: 0.12rem 0.55rem;
+    border-radius: 1rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+.tool-badge {
+    padding: 0.12rem 0.5rem;
+    border-radius: 0.45rem;
+    font-size: 0.78rem;
+}
+/* HITL review banner */
+.hitl-banner {
+    background: linear-gradient(135deg, rgba(255,152,0,0.12), rgba(255,87,34,0.06));
+    border: 1px solid rgba(255,152,0,0.3);
+    border-radius: 0.75rem;
+    padding: 1.2rem 1.5rem;
+    margin: 0.8rem 0 1.2rem 0;
+}
+.hitl-banner h3 {
+    margin: 0 0 0.3rem 0;
+    color: #ffa726;
+    font-size: 1.15rem;
+}
+.hitl-banner p {
+    color: rgba(250,250,250,0.6);
+    margin: 0;
+    font-size: 0.92rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Cached graph instance
 # ---------------------------------------------------------------------------
 
 @st.cache_resource
@@ -35,7 +117,7 @@ def get_app():
 graph_app = get_app()
 
 # ---------------------------------------------------------------------------
-# Friendly labels shown during streaming
+# Rendering constants
 # ---------------------------------------------------------------------------
 
 NODE_LABELS = {
@@ -46,6 +128,145 @@ NODE_LABELS = {
     "critic": "Reviewing schedule quality...",
     "human_review": "Ready for your review!",
 }
+
+TYPE_CONFIG = {
+    "work":    {"icon": "\U0001f4bb", "label": "Focus Work"},
+    "break":   {"icon": "\u2615",     "label": "Break"},
+    "travel":  {"icon": "\U0001f697", "label": "Travel"},
+    "fitness": {"icon": "\U0001f4aa", "label": "Fitness"},
+    "call":    {"icon": "\U0001f4de", "label": "Call"},
+    "errand":  {"icon": "\U0001f6d2", "label": "Errand"},
+    "meal":    {"icon": "\U0001f37d\ufe0f", "label": "Meal"},
+    "shower":  {"icon": "\U0001f6bf", "label": "Freshen Up"},
+}
+
+DEFAULT_TYPE = {"icon": "\U0001f4cb", "label": "Task"}
+
+
+def _priority_style(p):
+    """Return color/bg/label for a priority value."""
+    if p is None:
+        return {"color": "#78909c", "bg": "rgba(120,144,156,0.15)", "label": "\u2014"}
+    if p <= 3:
+        return {"color": "#ff6b6b", "bg": "rgba(255,75,75,0.15)", "label": f"P{p}"}
+    if p <= 6:
+        return {"color": "#ffa726", "bg": "rgba(255,167,38,0.15)", "label": f"P{p}"}
+    return {"color": "#66bb6a", "bg": "rgba(102,187,106,0.15)", "label": f"P{p}"}
+
+
+def _border_color(p):
+    if p is None:
+        return "#78909c"
+    if p <= 3:
+        return "#ff4b4b"
+    if p <= 6:
+        return "#ffa726"
+    return "#66bb6a"
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers
+# ---------------------------------------------------------------------------
+
+def render_card(entry: dict):
+    """Render a single schedule entry as a styled HTML card."""
+    t = TYPE_CONFIG.get(entry.get("type", ""), DEFAULT_TYPE)
+    p = entry.get("priority")
+    ps = _priority_style(p)
+    bc = _border_color(p)
+    title = html_lib.escape(entry.get("title", "Untitled"))
+    start = html_lib.escape(str(entry.get("start", "?")))
+    end = html_lib.escape(str(entry.get("end", "?")))
+    dur = entry.get("duration_min", "?")
+    loc = entry.get("location")
+    notes = entry.get("notes")
+    weather = entry.get("weather")
+    commute = entry.get("commute")
+
+    # Build metadata spans
+    meta_parts = [f"\u23f1 {dur} min"]
+    if loc:
+        meta_parts.append(f"\U0001f4cd {html_lib.escape(loc)}")
+    meta_html = "".join(f"<span>{m}</span>" for m in meta_parts)
+
+    # Build badge spans
+    badges = []
+    if weather:
+        badges.append(
+            f'<span class="tool-badge" style="background:rgba(30,136,229,0.12);'
+            f'color:#64b5f6;">\U0001f324\ufe0f {html_lib.escape(weather)}</span>'
+        )
+    if commute:
+        badges.append(
+            f'<span class="tool-badge" style="background:rgba(255,167,38,0.12);'
+            f'color:#ffb74d;">\U0001f6a6 {html_lib.escape(commute)}</span>'
+        )
+    badges_html = "".join(badges)
+
+    # Notes
+    notes_html = ""
+    if notes:
+        notes_html = f'<div class="card-notes">{html_lib.escape(notes)}</div>'
+
+    # Priority badge
+    pri_html = (
+        f'<span class="pri-badge" style="background:{ps["bg"]};'
+        f'color:{ps["color"]};">{ps["label"]}</span>'
+    )
+
+    card = f"""
+    <div class="sched-card" style="border-left:4px solid {bc};">
+        <div class="card-row">
+            <span class="card-title">{t["icon"]} {title}</span>
+            <div style="display:flex;gap:0.6rem;align-items:center;">
+                {pri_html}
+                <span class="card-time">{start} \u2013 {end}</span>
+            </div>
+        </div>
+        <div class="card-meta">{meta_html}</div>
+        {notes_html}
+        <div class="card-badges">{badges_html}</div>
+    </div>
+    """
+    st.markdown(card, unsafe_allow_html=True)
+
+
+def render_metrics(schedule_data: list):
+    """Render the top-level metrics dashboard from structured schedule data."""
+    if not schedule_data:
+        return
+
+    total_min = sum(e.get("duration_min", 0) for e in schedule_data)
+    hours, mins = divmod(total_min, 60)
+    end_time = schedule_data[-1].get("end", "?")
+    focus = [e for e in schedule_data if e.get("type") in ("work", "call", "errand")]
+    breaks = [e for e in schedule_data if e.get("type") == "break"]
+    weather = next(
+        (e["weather"] for e in schedule_data if e.get("weather")),
+        None,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Time", f"{hours}h {mins}m", delta=f"{len(schedule_data)} blocks")
+    c2.metric("Focus Tasks", str(len(focus)), delta=f"{len(breaks)} breaks")
+    c3.metric("Wraps Up At", end_time)
+    if weather:
+        # Extract short version: "Overcast, 13°C" from longer string
+        c4.metric("Weather", weather[:30])
+    else:
+        c4.metric("Weather", "N/A")
+
+
+def render_schedule(schedule_data: list, fallback_text: str):
+    """Render the full schedule — cards if structured data exists, else markdown."""
+    if schedule_data:
+        render_metrics(schedule_data)
+        st.markdown("---")
+        for entry in schedule_data:
+            render_card(entry)
+    else:
+        st.markdown(fallback_text)
+
 
 # ---------------------------------------------------------------------------
 # Session state initialization
@@ -60,7 +281,7 @@ if "location" not in st.session_state:
 if "user_timezone" not in st.session_state:
     st.session_state.user_timezone = "UTC"
 if "timeline" not in st.session_state:
-    st.session_state.timeline = []  # [{type: "schedule"/"tweak", content: "..."}]
+    st.session_state.timeline = []
 
 
 def get_config():
@@ -95,33 +316,28 @@ with st.sidebar:
     st.caption("Powered by Claude Haiku + LangGraph")
     st.caption(f"Session: `{st.session_state.thread_id}`")
 
-
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
 
 st.title("AI Daily Schedule Optimizer")
 try:
-    _display_tz = ZoneInfo(st.session_state.user_timezone)
+    _tz = ZoneInfo(st.session_state.user_timezone)
 except Exception:
-    _display_tz = ZoneInfo("UTC")
-_display_now = datetime.now(tz=_display_tz).strftime("%A, %B %d, %Y at %H:%M")
-st.caption(f"Today is {_display_now} ({st.session_state.user_timezone})")
+    _tz = ZoneInfo("UTC")
+_now_str = datetime.now(tz=_tz).strftime("%A, %B %d, %Y at %H:%M")
+st.caption(f"Today is {_now_str} ({st.session_state.user_timezone})")
 
 
 # ---------------------------------------------------------------------------
-# Helper: stream graph execution with live status updates
+# Helper: stream graph execution with live status
 # ---------------------------------------------------------------------------
 
 def run_graph_streaming(inputs, config, *, is_resume=False):
-    """
-    Stream graph execution and display node-level progress.
-    Returns True on success, False on error.
-    """
+    """Stream graph execution and show node-level progress."""
     with st.status("Working on your schedule...", expanded=True) as status:
         try:
-            stream = graph_app.stream(inputs, config, stream_mode="updates")
-            for chunk in stream:
+            for chunk in graph_app.stream(inputs, config, stream_mode="updates"):
                 for node_name in chunk:
                     label = NODE_LABELS.get(node_name, f"Running: {node_name}")
                     st.write(f"- {label}")
@@ -133,9 +349,9 @@ def run_graph_streaming(inputs, config, *, is_resume=False):
             return False
 
 
-# ---------------------------------------------------------------------------
-# Phase: INPUT — collect tasks, location, and optional file uploads
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Phase: INPUT
+# ===========================================================================
 
 if st.session_state.phase == "input":
     st.subheader("What do you need to get done today?")
@@ -158,10 +374,10 @@ if st.session_state.phase == "input":
     can_submit = bool(raw_tasks and raw_tasks.strip()) or bool(uploaded_files)
 
     if st.button("Generate My Schedule", type="primary", disabled=not can_submit):
-        # ---- Step 1: process uploaded files (outside the graph) ----
+        # Step 1: process uploaded files
         extracted_text = ""
         if uploaded_files:
-            with st.status("Processing uploaded files...", expanded=True) as fstatus:
+            with st.status("Processing uploaded files...", expanded=True) as fs:
                 for f in uploaded_files:
                     st.write(f"Reading: **{f.name}**")
                     try:
@@ -170,15 +386,15 @@ if st.session_state.phase == "input":
                         st.write(f"  {f.name} processed")
                     except Exception as e:
                         st.write(f"  {f.name} failed: {e}")
-                fstatus.update(label="Files processed!", state="complete")
+                fs.update(label="Files processed!", state="complete")
 
-        # ---- Step 2: resolve timezone from location ----
-        with st.status("Detecting timezone from your location...") as tz_status:
+        # Step 2: resolve timezone
+        with st.status("Detecting timezone...") as tz_s:
             user_tz = resolve_timezone(st.session_state.location)
             st.session_state.user_timezone = user_tz
-            tz_status.update(label=f"Timezone: {user_tz}", state="complete")
+            tz_s.update(label=f"Timezone: {user_tz}", state="complete")
 
-        # ---- Step 3: invoke the graph ----
+        # Step 3: invoke the graph
         initial_state = {
             "raw_tasks": raw_tasks or "See uploaded documents below.",
             "user_location": st.session_state.location,
@@ -195,9 +411,9 @@ if st.session_state.phase == "input":
             st.rerun()
 
 
-# ---------------------------------------------------------------------------
-# Phase: REVIEW — human-in-the-loop approval or tweaks (timeline view)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Phase: REVIEW — premium HITL interface with card timeline
+# ===========================================================================
 
 elif st.session_state.phase == "review":
     config = get_config()
@@ -209,52 +425,60 @@ elif st.session_state.phase == "review":
         st.rerun()
 
     values = snapshot.values
-    schedule = values.get("draft_schedule", "No schedule available.")
+    draft_text = values.get("draft_schedule", "No schedule available.")
+    structured = values.get("structured_schedule", [])
     critique = values.get("critique", "")
     revisions = values.get("revision_count", 0)
 
-    # Add current schedule to timeline if it's new
+    # Track timeline entries (tweak -> schedule -> tweak -> schedule ...)
+    timeline_key = f"{revisions}:{draft_text[:80]}"
     if (not st.session_state.timeline
-            or st.session_state.timeline[-1].get("content") != schedule):
+            or st.session_state.timeline[-1].get("_key") != timeline_key):
         st.session_state.timeline.append({
             "type": "schedule",
-            "content": schedule,
+            "_key": timeline_key,
+            "text": draft_text,
+            "structured": structured,
             "critique": critique,
             "revision": revisions,
         })
 
-    # --- Render full timeline ---
-    st.subheader("Schedule Timeline")
+    # --- Render previous timeline entries (collapsed) ---
+    has_history = any(
+        e["type"] == "schedule"
+        for e in st.session_state.timeline[:-1]
+    )
+    if has_history:
+        with st.expander("Previous Revisions", expanded=False):
+            for entry in st.session_state.timeline[:-1]:
+                if entry["type"] == "tweak":
+                    st.markdown(
+                        f'> **Your tweak:** *"{entry["content"]}"*'
+                    )
+                elif entry["type"] == "schedule":
+                    st.caption(f"Schedule v{entry['revision']}")
+                    st.text(entry["text"][:400] + "..." if len(entry["text"]) > 400 else entry["text"])
+                    st.divider()
 
-    for i, entry in enumerate(st.session_state.timeline):
-        if entry["type"] == "tweak":
-            st.markdown(f"**Your tweak:** {entry['content']}")
-            st.divider()
+    # --- Render latest schedule with premium cards ---
+    st.subheader(f"Schedule v{revisions}")
+    render_schedule(structured, draft_text)
 
-        elif entry["type"] == "schedule":
-            is_latest = (i == len(st.session_state.timeline) - 1)
-            label = "Latest Schedule" if is_latest else f"Schedule v{entry['revision']}"
+    if critique:
+        with st.expander("Critic's Assessment", expanded=False):
+            st.markdown(critique)
 
-            if is_latest:
-                # Show the latest schedule expanded
-                st.markdown(f"**{label}** (revision {entry['revision']} of 3)")
-                st.markdown(entry["content"])
-                if entry.get("critique"):
-                    with st.expander("Critic's Assessment", expanded=False):
-                        st.markdown(entry["critique"])
-            else:
-                # Collapse older schedules
-                with st.expander(label, expanded=False):
-                    st.markdown(entry["content"])
-                    if entry.get("critique"):
-                        st.caption("Critic: " + entry["critique"][:200] + "...")
-
-            st.divider()
+    # --- HITL review banner ---
+    st.markdown("""
+    <div class="hitl-banner">
+        <h3>\u23f8\ufe0f Review Required</h3>
+        <p>The AI has drafted your schedule and is waiting for your approval.
+           Approve it or describe what you'd like changed.</p>
+    </div>
+    """, unsafe_allow_html=True)
 
     st.info(f"Revisions used: {revisions} of 3")
 
-    # --- Action buttons ---
-    st.subheader("Your Decision")
     col1, col2 = st.columns([1, 2])
 
     with col1:
@@ -269,11 +493,10 @@ elif st.session_state.phase == "review":
 
     with col2:
         tweaks = st.text_input(
-            "Or describe your tweaks:",
+            "Describe your tweaks:",
             placeholder="e.g. Move gym to morning, add lunch break",
         )
         if st.button("Submit Tweaks", use_container_width=True) and tweaks:
-            # Record the tweak in the timeline before running the graph
             st.session_state.timeline.append({
                 "type": "tweak",
                 "content": tweaks,
@@ -287,38 +510,47 @@ elif st.session_state.phase == "review":
                 st.rerun()
 
 
-# ---------------------------------------------------------------------------
-# Phase: DONE — display final schedule
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Phase: DONE — final dashboard
+# ===========================================================================
 
 elif st.session_state.phase == "done":
     config = get_config()
-    final_state = graph_app.get_state(config).values
+    final = graph_app.get_state(config).values
+
+    draft_text = final.get("draft_schedule", "No schedule generated.")
+    structured = final.get("structured_schedule", [])
+    critique = final.get("critique", "")
+    rev_count = final.get("revision_count", 0)
 
     st.subheader("Final Optimized Schedule")
-    st.markdown(final_state.get("draft_schedule", "No schedule generated."))
+    render_schedule(structured, draft_text)
 
-    critique = final_state.get("critique", "")
     if critique:
         with st.expander("Final Assessment", expanded=True):
             st.markdown(critique)
 
-    st.success(
-        f"Schedule complete! Total revisions: "
-        f"{final_state.get('revision_count', 0)}"
-    )
+    st.success(f"Schedule complete! Total revisions: {rev_count}")
 
-    # Show previous revisions if any tweaks were made
+    # Revision history
     if len(st.session_state.timeline) > 1:
         st.divider()
         with st.expander("Revision History", expanded=False):
             for entry in st.session_state.timeline:
                 if entry["type"] == "tweak":
-                    st.markdown(f"**Your tweak:** {entry['content']}")
-                    st.divider()
+                    st.markdown(f'> **Your tweak:** *"{entry["content"]}"*')
                 elif entry["type"] == "schedule":
-                    st.markdown(f"**Schedule v{entry['revision']}**")
-                    st.markdown(entry["content"][:500] + "..." if len(entry["content"]) > 500 else entry["content"])
+                    st.caption(f"Schedule v{entry['revision']}")
+                    old = entry.get("structured", [])
+                    if old:
+                        for e in old:
+                            tc = TYPE_CONFIG.get(e.get("type", ""), DEFAULT_TYPE)
+                            st.text(
+                                f"  {e.get('start','?')}-{e.get('end','?')}  "
+                                f"{tc['icon']} {e.get('title','?')}"
+                            )
+                    else:
+                        st.text(entry["text"][:300])
                     st.divider()
 
     st.divider()
