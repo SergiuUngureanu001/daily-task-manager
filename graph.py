@@ -116,7 +116,7 @@ def build_graph(sqlite_conn=None):
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("   AI DAILY SCHEDULE OPTIMIZER")
+    print("   AI WEEKLY SCHEDULE OPTIMIZER")
     print("   Powered by Claude Haiku + LangGraph")
     print("=" * 55)
 
@@ -151,14 +151,14 @@ if __name__ == "__main__":
     else:
         # --- Fresh scheduling session ---
         now = datetime.now().strftime("%A, %B %d, %Y at %H:%M")
-        print(f"\n  Today is {now}")
+        print(f"\n  Starting weekly plan from {now}")
 
         user_location = input(
             "\nWhat is your current location? (e.g. '123 Main St, Austin, TX')\n> "
         ).strip() or "Home"
 
         user_input = input(
-            "\nWhat do you need to get done today?\n> "
+            "\nWhat do you need to get done this week?\n> "
         ).strip()
 
         if not user_input:
@@ -203,7 +203,7 @@ if __name__ == "__main__":
     final_state = app.get_state(config).values
 
     print(f"\n{'=' * 55}")
-    print("   FINAL OPTIMIZED SCHEDULE")
+    print("   FINAL OPTIMIZED WEEKLY SCHEDULE")
     print(f"{'=' * 55}")
     print(final_state.get("draft_schedule", "No schedule generated."))
 

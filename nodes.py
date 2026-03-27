@@ -3,7 +3,7 @@ import io
 import json
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -26,7 +26,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 llm = ChatAnthropic(
     model="claude-haiku-4-5-20251001",
     max_retries=3,
-    timeout=60,
+    timeout=120,
 )
 
 
@@ -86,14 +86,34 @@ def _now(state) -> str:
     return datetime.now(tz=tz).strftime("%A, %B %d, %Y at %H:%M")
 
 
+def _week_dates(state) -> list[dict]:
+    """Return a list of {day_name, date_str} for the next 7 days starting today."""
+    tz_name = state.get("user_timezone", "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    today = datetime.now(tz=tz).date()
+    days = []
+    for i in range(7):
+        d = today + timedelta(days=i)
+        days.append({
+            "day_name": d.strftime("%A"),
+            "date_str": d.strftime("%Y-%m-%d"),
+            "display": d.strftime("%A, %B %d"),
+        })
+    return days
+
+
 # ---------------------------------------------------------------------------
-# Schedule JSON parsing helpers
+# Schedule JSON parsing helpers (weekly format)
 # ---------------------------------------------------------------------------
 
 def _parse_schedule_response(response_content):
     """
-    Parse the scheduler's LLM response into (structured_list, text_version).
-    Falls back to ([], raw_text) if JSON extraction fails.
+    Parse the scheduler's LLM response into (structured_dict, text_version).
+    The structured_dict is keyed by day name: {"Monday": [...], "Tuesday": [...]}.
+    Falls back to ({}, raw_text) if JSON extraction fails.
     """
     raw = extract_text(response_content)
 
@@ -101,43 +121,65 @@ def _parse_schedule_response(response_content):
     for attempt in [raw, raw.strip().strip("`").removeprefix("json").strip()]:
         try:
             data = json.loads(attempt)
-            if isinstance(data, list):
+            if isinstance(data, dict):
                 return data, _schedule_to_text(data)
+            # If the LLM returns a flat list, wrap it under "Today"
+            if isinstance(data, list):
+                wrapped = {"Today": data}
+                return wrapped, _schedule_to_text(wrapped)
         except (json.JSONDecodeError, TypeError):
             continue
 
-    # Try to extract a JSON array from mixed text
+    # Try to extract a JSON object from mixed text
+    try:
+        start = raw.index("{")
+        end = raw.rindex("}") + 1
+        data = json.loads(raw[start:end])
+        if isinstance(data, dict):
+            return data, _schedule_to_text(data)
+    except (ValueError, json.JSONDecodeError):
+        pass
+
+    # Try to extract a JSON array (legacy single-day format)
     try:
         start = raw.index("[")
         end = raw.rindex("]") + 1
         data = json.loads(raw[start:end])
         if isinstance(data, list):
-            return data, _schedule_to_text(data)
+            wrapped = {"Today": data}
+            return wrapped, _schedule_to_text(wrapped)
     except (ValueError, json.JSONDecodeError):
         pass
 
     print("  Warning: could not parse schedule JSON, using raw text.")
-    return [], raw
+    return {}, raw
 
 
-def _schedule_to_text(entries):
-    """Convert structured schedule JSON to readable text for the critic."""
+def _schedule_to_text(week_data):
+    """Convert structured weekly schedule dict to readable text for the critic."""
     lines = []
-    for e in entries:
-        p = f" [Priority {e['priority']}]" if e.get("priority") else ""
-        lines.append(
-            f"{e.get('start','?')} - {e.get('end','?')} | "
-            f"{e.get('title','Untitled')}{p} ({e.get('duration_min','?')} min)"
-        )
-        if e.get("location"):
-            lines.append(f"  Location: {e['location']}")
-        if e.get("notes"):
-            lines.append(f"  {e['notes']}")
-        if e.get("weather"):
-            lines.append(f"  Weather: {e['weather']}")
-        if e.get("commute"):
-            lines.append(f"  Commute: {e['commute']}")
-        lines.append("")
+    for day_name, entries in week_data.items():
+        lines.append(f"\n{'='*40}")
+        lines.append(f"  {day_name}")
+        lines.append(f"{'='*40}")
+        if not isinstance(entries, list):
+            lines.append(str(entries))
+            continue
+        for e in entries:
+            p = f" [Priority {e['priority']}]" if e.get("priority") else ""
+            lines.append(
+                f"{e.get('start','?')} - {e.get('end','?')} | "
+                f"{e.get('title','Untitled')}{p} ({e.get('duration_min','?')} min)"
+            )
+            if e.get("location"):
+                lines.append(f"  Location: {e['location']}")
+            if e.get("notes"):
+                lines.append(f"  {e['notes']}")
+            if e.get("weather"):
+                lines.append(f"  Weather: {e['weather']}")
+            if e.get("commute"):
+                lines.append(f"  Commute: {e['commute']}")
+            lines.append("")
     return "\n".join(lines)
 
 
@@ -225,9 +267,6 @@ def document_processor(state: SchedulerState):
 def get_weather(location: str) -> str:
     """Get current weather conditions for a location to help plan outdoor activities."""
     try:
-        # Step 1: Geocode via Open-Meteo's free geocoder (no API key needed)
-        # Try the full location first, then fall back to just the city name
-        # (Open-Meteo geocoder works best with city/place names, not full addresses)
         results = []
         for query in [location, location.split(",")[0].strip()]:
             geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={requests.utils.quote(query)}&count=1"
@@ -245,7 +284,6 @@ def get_weather(location: str) -> str:
         resolved_name = results[0].get("name", location)
         country = results[0].get("country", "")
 
-        # Step 2: Fetch current weather from Open-Meteo
         weather_url = (
             f"https://api.open-meteo.com/v1/forecast?"
             f"latitude={lat}&longitude={lng}"
@@ -288,16 +326,80 @@ def get_weather(location: str) -> str:
 
 
 @tool
+def get_weekly_forecast(location: str) -> str:
+    """Get a 7-day weather forecast for a location to help plan the week ahead.
+    Returns daily high/low temperatures and conditions for each day."""
+    try:
+        results = []
+        for query in [location, location.split(",")[0].strip()]:
+            geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={requests.utils.quote(query)}&count=1"
+            geo_resp = requests.get(geo_url, timeout=10)
+            geo_resp.raise_for_status()
+            results = geo_resp.json().get("results", [])
+            if results:
+                break
+
+        if not results:
+            return f"Could not find coordinates for '{location}'."
+
+        lat = results[0]["latitude"]
+        lng = results[0]["longitude"]
+        resolved_name = results[0].get("name", location)
+
+        weather_url = (
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lng}"
+            f"&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max"
+            f"&temperature_unit=celsius&forecast_days=7"
+        )
+        resp = requests.get(weather_url, timeout=10)
+        resp.raise_for_status()
+        daily = resp.json().get("daily", {})
+
+        wmo_descriptions = {
+            0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+            45: "Foggy", 48: "Rime fog", 51: "Light drizzle", 53: "Drizzle",
+            55: "Dense drizzle", 61: "Light rain", 63: "Rain", 65: "Heavy rain",
+            71: "Light snow", 73: "Snow", 75: "Heavy snow",
+            80: "Light showers", 81: "Showers", 82: "Heavy showers",
+            95: "Thunderstorm", 96: "T-storm + hail", 99: "Severe T-storm",
+        }
+
+        dates = daily.get("time", [])
+        lines = [f"7-day forecast for {resolved_name}:"]
+        for i, date_str in enumerate(dates):
+            d = datetime.strptime(date_str, "%Y-%m-%d")
+            day_name = d.strftime("%A")
+            code = daily.get("weather_code", [0])[i] if i < len(daily.get("weather_code", [])) else 0
+            t_max = daily.get("temperature_2m_max", [0])[i] if i < len(daily.get("temperature_2m_max", [])) else "?"
+            t_min = daily.get("temperature_2m_min", [0])[i] if i < len(daily.get("temperature_2m_min", [])) else "?"
+            precip = daily.get("precipitation_probability_max", [0])[i] if i < len(daily.get("precipitation_probability_max", [])) else 0
+            wind = daily.get("wind_speed_10m_max", [0])[i] if i < len(daily.get("wind_speed_10m_max", [])) else "?"
+            desc = wmo_descriptions.get(code, f"Code {code}")
+            lines.append(
+                f"  {day_name} ({date_str}): {desc}, {t_min}°C-{t_max}°C, "
+                f"rain {precip}%, wind {wind} km/h"
+            )
+
+        result = "\n".join(lines)
+        print(f"    [Tool] get_weekly_forecast({location}) -> {len(dates)} days")
+        return result
+
+    except Exception as e:
+        error_msg = f"Weekly forecast failed for '{location}': {e}"
+        print(f"    [Tool] get_weekly_forecast -> ERROR: {error_msg}")
+        return error_msg
+
+
+@tool
 def estimate_commute(origin: str, destination: str) -> str:
     """Estimate travel/commute time between two locations using Google Maps Routes API.
     Returns the shortest route duration and distance."""
     try:
-        # Google Routes API (New) — computeRoutes endpoint
         url = "https://routes.googleapis.com/directions/v2:computeRoutes"
         headers = {
             "Content-Type": "application/json",
             "X-Goog-Api-Key": GOOGLE_API_KEY,
-            # Request these fields in the response
             "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.description",
         }
         body = {
@@ -318,8 +420,6 @@ def estimate_commute(origin: str, destination: str) -> str:
             print(f"    [Tool] estimate_commute -> {result}")
             return result
 
-        # Pick the shortest route by duration
-        # Duration comes as e.g. "1523s" — parse the seconds
         def parse_duration_seconds(route):
             dur_str = route.get("duration", "0s")
             return int(dur_str.rstrip("s"))
@@ -339,7 +439,6 @@ def estimate_commute(origin: str, destination: str) -> str:
         return result
 
     except requests.exceptions.HTTPError as e:
-        # Surface the actual Google error message if available
         try:
             error_detail = e.response.json().get("error", {}).get("message", str(e))
         except Exception:
@@ -354,7 +453,7 @@ def estimate_commute(origin: str, destination: str) -> str:
 
 
 # Bundle tools for binding and for the ToolNode
-tools = [get_weather, estimate_commute]
+tools = [get_weather, get_weekly_forecast, estimate_commute]
 llm_with_tools = llm.bind_tools(tools)
 
 # Pre-built ToolNode executes whichever tools the LLM requested
@@ -362,22 +461,27 @@ tool_node = ToolNode(tools)
 
 
 # ---------------------------------------------------------------------------
-# Node 1: Task Ingester
+# Node 1: Task Ingester (weekly-aware)
 # ---------------------------------------------------------------------------
 
 def task_ingester(state: SchedulerState):
     """
-    Parses the user's raw, messy input into structured tasks.
-    Injects the exact current time so the LLM can reason about deadlines.
+    Parses the user's raw, messy input into structured tasks with weekly context.
+    Assigns preferred days, detects recurring tasks, and extracts date deadlines.
     """
-    print("\n--- INGESTING TASKS ---")
+    print("\n--- INGESTING TASKS (WEEKLY) ---")
     raw_tasks = state.get("raw_tasks", "No tasks provided.")
     now = _now(state)
-
+    week = _week_dates(state)
     user_location = state.get("user_location", "Home")
 
-    prompt = f"""You are an expert task analyzer. The current date and time is: {now}
+    week_display = "\n".join(f"  - {d['display']} ({d['date_str']})" for d in week)
+
+    prompt = f"""You are an expert task analyzer for WEEKLY planning. The current date and time is: {now}
 The user is currently located at: {user_location}
+
+THE PLANNING WEEK (7 days starting today):
+{week_display}
 
 Analyze these raw tasks: "{raw_tasks}"
 
@@ -386,6 +490,9 @@ For each task:
 - Assign a priority from 1 to 10 (1 = most urgent/important, 10 = least).
 - Note any implied deadlines relative to the current time.
 - Note any locations mentioned (useful for travel/commute planning).
+- Determine if the task specifies or implies a particular day of the week. If so, set "preferred_day" to that day name (e.g. "Monday"). If flexible, set to null.
+- Determine if this is a recurring task (e.g. "gym every Mon/Wed/Fri", "daily standup"). If so, set "is_recurring" to true and list the day names in "recurrence_days". Otherwise false and [].
+- If the task has a hard date deadline (e.g. "submit report by Thursday"), set "date_deadline" to the YYYY-MM-DD date. Otherwise null.
 
 LOCATION DISAMBIGUATION:
 If a task mentions a place name without a full address or city, assume it is
@@ -395,11 +502,10 @@ output "Mega Image, Piata Alba Iulia, Bucuresti" — NOT the city of Alba Iulia
 in Transylvania. Always resolve ambiguous locations to the nearest local match.
 
 Return ONLY a valid JSON list of objects — no markdown, no code fences:
-[{{"task": "name", "duration": 60, "priority": 1, "deadline": "HH:MM or null", "location": "full disambiguated address or null"}}]"""
+[{{"task": "name", "duration": 60, "priority": 1, "deadline": "HH:MM or null", "location": "full disambiguated address or null", "preferred_day": "Monday or null", "is_recurring": false, "recurrence_days": [], "date_deadline": "YYYY-MM-DD or null"}}]"""
 
     response = llm.invoke([HumanMessage(content=prompt)])
 
-    # Attempt to parse JSON from the LLM response
     try:
         raw_text = extract_text(response.content)
         cleaned = raw_text.strip().strip("`").removeprefix("json").strip()
@@ -407,7 +513,9 @@ Return ONLY a valid JSON list of objects — no markdown, no code fences:
     except (json.JSONDecodeError, AttributeError) as e:
         print(f"  Warning: could not parse task JSON ({e}). Using fallback.")
         parsed_tasks = [
-            {"task": raw_tasks, "duration": 60, "priority": 5, "deadline": None, "location": None}
+            {"task": raw_tasks, "duration": 60, "priority": 5, "deadline": None,
+             "location": None, "preferred_day": None, "is_recurring": False,
+             "recurrence_days": [], "date_deadline": None}
         ]
 
     summary_msg = HumanMessage(
@@ -424,19 +532,15 @@ Return ONLY a valid JSON list of objects — no markdown, no code fences:
 
 
 # ---------------------------------------------------------------------------
-# Node 2: Scheduler (tool-calling agent)
+# Node 2: Scheduler (weekly tool-calling agent)
 # ---------------------------------------------------------------------------
 
 def scheduler(state: SchedulerState):
     """
-    Drafts a chronological schedule. Uses bound tools (weather, commute)
-    when the plan involves travel or outdoor activities.
-
-    If the last message is a ToolMessage, this is a continuation after tool
-    execution — re-invoke the LLM with the full message history so it can
-    incorporate the tool results into its schedule.
+    Drafts a 7-day chronological schedule. Uses bound tools (weather, forecast,
+    commute) when the plan involves travel or outdoor activities.
     """
-    print("\n--- DRAFTING SCHEDULE ---")
+    print("\n--- DRAFTING WEEKLY SCHEDULE ---")
     messages = state.get("messages", [])
     revision_count = state.get("revision_count", 0)
 
@@ -458,12 +562,18 @@ def scheduler(state: SchedulerState):
     critique = state.get("critique", "")
     user_location = state.get("user_location", "Home")
     now = _now(state)
+    week = _week_dates(state)
 
     critique_section = critique if critique else "None — this is the first draft."
+    week_display = "\n".join(f"  - {d['display']} ({d['date_str']})" for d in week)
 
-    prompt = f"""You are an expert productivity scheduler. The current time is: {now}
+    prompt = f"""You are an expert productivity scheduler planning a FULL 7-DAY WEEK.
+The current time is: {now}
 
 USER'S CURRENT LOCATION: {user_location}
+
+THE PLANNING WEEK:
+{week_display}
 
 TASKS TO SCHEDULE:
 {json.dumps(parsed_tasks, indent=2)}
@@ -472,29 +582,40 @@ PREVIOUS CRITIQUE TO ADDRESS:
 {critique_section}
 
 SCHEDULING HIERARCHY (in strict order of precedence):
-1. Hard deadlines and fixed appointments provided by the user are ABSOLUTE — never violate them.
-2. Direct instructions from the user's critique (e.g. "Do X at 9:00") override all other logic.
-3. Only when time is flexible should you sort by the 1-10 priority scale.
-4. Do NOT arrive at locations more than 15 minutes early — time travel precisely.
+1. Hard deadlines (date_deadline) and fixed appointments are ABSOLUTE — never violate them.
+2. Direct instructions from the user's critique (e.g. "Move gym to Wednesday") override all other logic.
+3. Tasks with preferred_day should be placed on that day when possible.
+4. Recurring tasks (is_recurring=true) must appear on ALL their recurrence_days.
+5. Only when time is flexible should you sort by the 1-10 priority scale.
+6. Do NOT arrive at locations more than 15 minutes early — time travel precisely.
 
-RULES:
-1. Start the schedule from NOW ({now}). Do NOT use a generic 9-to-5 template.
-2. Include 5-10 minute breaks between tasks.
-3. ONLY schedule the tasks listed above — do not invent new ones.
-4. Do NOT create oversized buffer blocks. Once a task is done, move to the next one.
-5. If a task cannot fit tonight, mark it as deferred with a suggested time tomorrow — but still include ALL remaining tasks that DO fit.
+WEEKLY PLANNING RULES:
+1. TODAY ({week[0]['display']}): Start from NOW ({now}). Do NOT use a generic 9-to-5 template.
+2. FUTURE DAYS: Plan from 08:00 to 23:00 (respect sleep boundaries — no tasks before 07:00 or after 23:30).
+3. Include 5-10 minute breaks between tasks.
+4. ONLY schedule the tasks listed above — do not invent new ones.
+5. Do NOT create oversized buffer blocks. Once a task is done, move to the next one.
+6. Balance workload across the week — avoid stacking everything on one day.
+7. Group location-based tasks on the same day to minimize commute.
+8. Place high-priority tasks earlier in the week when possible.
+9. Recurring tasks (e.g. gym Mon/Wed/Fri) must appear on each specified day.
+10. If a task has a date_deadline, it MUST be completed on or before that date.
 
 MANDATORY TOOL USAGE:
 Before generating the schedule, you MUST call the following tools:
-- For ANY task that has a non-null "location" field, call estimate_commute(origin="{user_location}", destination=<task location>) to get realistic travel time. Add this travel time to the schedule.
-- For ANY outdoor or physical task (gym, sports, walking, park, etc.), call get_weather(location="{user_location}") to check conditions and note them in the schedule.
+- Call get_weekly_forecast(location="{user_location}") to get the 7-day weather outlook. Use this to plan outdoor activities on good-weather days.
+- For ANY task with a non-null "location" field, call estimate_commute(origin="{user_location}", destination=<task location>) to get realistic travel time.
+- For ANY outdoor or physical task (gym, sports, walking, park, etc.), call get_weather(location="{user_location}") for current conditions (today's tasks).
 Do NOT skip tool calls. Call the tools FIRST, then build the schedule using their results.
 
 OUTPUT FORMAT:
-Return ONLY a valid JSON array — no markdown fences, no text before or after.
-Each element is one scheduled block:
-[{{"start":"HH:MM","end":"HH:MM","title":"Task Name","type":"work|break|travel|fitness|call|errand|meal|shower","priority":1,"duration_min":60,"location":"place or null","notes":"1-line context or null","weather":"brief weather note or null","commute":"travel info or null"}}]
+Return ONLY a valid JSON object — no markdown fences, no text before or after.
+The object is keyed by day name, each value is an array of scheduled blocks:
 
+{{"Monday": [{{"start":"HH:MM","end":"HH:MM","title":"Task Name","type":"work|break|travel|fitness|call|errand|meal|shower","priority":1,"duration_min":60,"location":"place or null","notes":"1-line context or null","weather":"brief weather note or null","commute":"travel info or null"}}], "Tuesday": [...], ...}}
+
+Include ALL 7 days of the week ({', '.join(d['day_name'] for d in week)}).
+Days with no tasks should still appear with an empty array.
 type must be one of: work, break, travel, fitness, call, errand, meal, shower.
 priority is 1-10 for real tasks, null for breaks/travel."""
 
@@ -518,34 +639,45 @@ priority is 1-10 for real tasks, null for breaks/travel."""
 
 
 # ---------------------------------------------------------------------------
-# Node 3: Critic
+# Node 3: Critic (weekly-aware)
 # ---------------------------------------------------------------------------
 
 def critic(state: SchedulerState):
     """
-    Evaluates the draft schedule against the original tasks, priorities,
-    deadlines, and the current time. Outputs specific fixes or 'PERFECT'.
+    Evaluates the weekly draft schedule holistically — checks coverage,
+    balance, recurring tasks, deadlines, and workload distribution.
     """
-    print("\n--- CRITIQUING SCHEDULE ---")
+    print("\n--- CRITIQUING WEEKLY SCHEDULE ---")
     draft_schedule = state.get("draft_schedule", "")
     parsed_tasks = state.get("parsed_tasks", [])
     revision_count = state.get("revision_count", 0)
     now = _now(state)
+    week = _week_dates(state)
 
-    prompt = f"""You are a strict productivity critic. The current time is: {now}
+    week_display = "\n".join(f"  - {d['display']} ({d['date_str']})" for d in week)
 
-PROPOSED SCHEDULE:
+    prompt = f"""You are a strict productivity critic evaluating a WEEKLY schedule.
+The current time is: {now}
+
+THE PLANNING WEEK:
+{week_display}
+
+PROPOSED WEEKLY SCHEDULE:
 {draft_schedule}
 
 ORIGINAL TASKS:
 {json.dumps(parsed_tasks, indent=2)}
 
 Evaluate against these criteria:
-1. Are ALL tasks included? None should be missing.
-2. Are high-priority tasks (priority closest to 1) scheduled earlier in the day?
-3. Are deadlines respected given the current time?
-4. Is there realistic buffer and travel time between tasks?
-5. Does the schedule start from the current time, not a generic morning?
+1. COMPLETENESS: Are ALL tasks included? None should be missing. Recurring tasks must appear on every specified recurrence day.
+2. DEADLINES: Are all date_deadline constraints met? Tasks must be scheduled on or before their deadline date.
+3. DAY PREFERENCES: Are preferred_day assignments respected?
+4. WORKLOAD BALANCE: Is the work spread reasonably across the week? No single day should be overloaded while others are empty.
+5. TODAY'S SCHEDULE: Does today's plan start from the current time, not a generic morning?
+6. SLEEP BOUNDARIES: No tasks scheduled before 07:00 or after 23:30.
+7. PRIORITY ORDER: Within each day, are high-priority tasks (closest to 1) scheduled earlier?
+8. TRAVEL LOGIC: Tasks with locations have realistic commute time? Location-based tasks grouped on same days?
+9. BREAKS: Are there reasonable breaks between tasks?
 
 This is revision {revision_count} of 7.
 
@@ -555,7 +687,6 @@ Otherwise, provide a concise bulleted list of specific changes needed."""
     response = llm.invoke([HumanMessage(content=prompt)])
     critique_text = extract_text(response.content).strip()
 
-    # Log to message history so future iterations have context
     critic_log = HumanMessage(
         content=f"[Critic — Revision {revision_count}] {critique_text}"
     )
@@ -577,10 +708,6 @@ def human_review(state: SchedulerState):
     """
     Pauses the graph using LangGraph's interrupt() mechanism.
     The user is asked to approve the schedule or provide manual tweaks.
-
-    - On approval: sets human_feedback to 'approved' and routes to END.
-    - On tweak: injects the feedback as a new critique and routes back
-      to the scheduler for another revision.
     """
     print("\n--- AWAITING HUMAN REVIEW ---")
 
@@ -588,14 +715,11 @@ def human_review(state: SchedulerState):
     critique = state.get("critique", "")
     revision_count = state.get("revision_count", 0)
 
-    # interrupt() pauses the graph and surfaces this payload to the caller.
-    # When the caller resumes with Command(resume=<value>), that value is
-    # returned here as `feedback`.
     feedback = interrupt({
         "schedule": schedule,
         "final_critique": critique,
         "revisions_used": revision_count,
-        "prompt": "Do you approve this schedule? Type 'approve' or describe your tweaks.",
+        "prompt": "Do you approve this weekly schedule? Type 'approve' or describe your tweaks.",
     })
 
     feedback_str = str(feedback).strip()
@@ -604,7 +728,7 @@ def human_review(state: SchedulerState):
         print("  User approved the schedule.")
         return {
             "human_feedback": "approved",
-            "messages": [HumanMessage(content="[Human] Schedule approved.")],
+            "messages": [HumanMessage(content="[Human] Weekly schedule approved.")],
         }
     else:
         print(f"  User requested changes: {feedback_str}")
