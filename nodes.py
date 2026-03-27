@@ -471,12 +471,18 @@ TASKS TO SCHEDULE:
 PREVIOUS CRITIQUE TO ADDRESS:
 {critique_section}
 
+SCHEDULING HIERARCHY (in strict order of precedence):
+1. Hard deadlines and fixed appointments provided by the user are ABSOLUTE — never violate them.
+2. Direct instructions from the user's critique (e.g. "Do X at 9:00") override all other logic.
+3. Only when time is flexible should you sort by the 1-10 priority scale.
+4. Do NOT arrive at locations more than 15 minutes early — time travel precisely.
+
 RULES:
 1. Start the schedule from NOW ({now}). Do NOT use a generic 9-to-5 template.
-2. Schedule higher-priority tasks (priority closer to 1) earlier in the day.
-3. Respect any deadlines relative to the current time.
-4. Include 5-10 minute breaks between tasks.
-5. ONLY schedule the tasks listed above — do not invent new ones.
+2. Include 5-10 minute breaks between tasks.
+3. ONLY schedule the tasks listed above — do not invent new ones.
+4. Do NOT create oversized buffer blocks. Once a task is done, move to the next one.
+5. If a task cannot fit tonight, mark it as deferred with a suggested time tomorrow — but still include ALL remaining tasks that DO fit.
 
 MANDATORY TOOL USAGE:
 Before generating the schedule, you MUST call the following tools:
