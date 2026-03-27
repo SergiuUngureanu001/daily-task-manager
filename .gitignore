@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.env
+scheduler_memory.db
+scheduler_memory.db-wal
+scheduler_memory.db-shm
+scheduler_memory.db-journal
+.streamlit/
