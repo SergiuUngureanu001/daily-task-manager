@@ -1,0 +1,17 @@
+services:
+  app:
+    build: .
+    container_name: daily-task-manager
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      # Persist the SQLite database across container restarts
+      - db_data:/app/data
+    environment:
+      - STREAMLIT_SERVER_MAX_UPLOAD_SIZE=10
+    restart: unless-stopped
+
+volumes:
+  db_data:

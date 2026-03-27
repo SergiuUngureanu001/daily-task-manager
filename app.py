@@ -9,7 +9,7 @@ from datetime import datetime
 import streamlit as st
 from langgraph.types import Command
 
-from graph import build_graph
+from graph import build_graph, DB_PATH
 from nodes import process_uploaded_file
 
 # ---------------------------------------------------------------------------
@@ -28,7 +28,7 @@ st.set_page_config(
 
 @st.cache_resource
 def get_app():
-    conn = sqlite3.connect("scheduler_memory.db", check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     return build_graph(conn)
 
 graph_app = get_app()

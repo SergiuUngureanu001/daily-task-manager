@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from datetime import datetime
 
@@ -63,6 +64,10 @@ def route_after_human(state: SchedulerState):
 # Graph construction — reusable builder for both terminal and Streamlit
 # ---------------------------------------------------------------------------
 
+DB_DIR = "/app/data" if os.path.isdir("/app/data") else "."
+DB_PATH = os.path.join(DB_DIR, "scheduler_memory.db")
+
+
 def build_graph(sqlite_conn=None):
     """
     Build and compile the scheduling graph.
@@ -114,7 +119,7 @@ if __name__ == "__main__":
     print("   Powered by Claude Haiku + LangGraph")
     print("=" * 55)
 
-    sqlite_conn = sqlite3.connect("scheduler_memory.db", check_same_thread=False)
+    sqlite_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     app = build_graph(sqlite_conn)
 
     # Thread ID is date-based so today's session persists across restarts
