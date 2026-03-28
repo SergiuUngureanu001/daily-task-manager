@@ -6,4 +6,8 @@ scheduler_memory.db
 scheduler_memory.db-wal
 scheduler_memory.db-shm
 scheduler_memory.db-journal
+session_history.db
+session_history.db-wal
+session_history.db-shm
+session_history.db-journal
 .streamlit/

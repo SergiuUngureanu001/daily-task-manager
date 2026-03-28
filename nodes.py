@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from langchain_anthropic import ChatAnthropic
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolNode
@@ -16,25 +16,40 @@ from langgraph.types import interrupt
 from pypdf import PdfReader
 
 try:
-    from anthropic import RateLimitError as AnthropicRateLimitError
+    from google.api_core.exceptions import ResourceExhausted as GoogleRateLimitError
 except ImportError:
-    AnthropicRateLimitError = None
+    GoogleRateLimitError = None
 
-from state import SchedulerState
+from state import SchedulerState, RescheduleState
 
 load_dotenv(override=True)
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # ---------------------------------------------------------------------------
-# LLM setup — Claude Haiku via Anthropic API
+# LLM setup — Gemini 2.5 Pro via Google AI API
+# Two instances: one precise (temperature=0, no thinking) for structured JSON
+# output, and one with thinking enabled for the critic's reasoning.
 # ---------------------------------------------------------------------------
-# max_retries=0 disables the SDK's own fast retries for rate limits — we handle
-# backoff ourselves in _invoke_with_backoff with longer, smarter delays.
-llm = ChatAnthropic(
-    model="claude-haiku-4-5-20251001",
+_gemini_api_key = os.getenv("GOOGLE_GEMINI_API_KEY")
+
+# Structured output LLM — temperature=0 for reliable JSON, no thinking
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-pro",
+    google_api_key=_gemini_api_key,
+    temperature=0,
     max_retries=0,
-    timeout=120,
+    timeout=180,
+)
+
+# Thinking LLM — used only for the critic node where reasoning helps
+llm_thinking = ChatGoogleGenerativeAI(
+    model="gemini-2.5-pro",
+    google_api_key=_gemini_api_key,
+    temperature=1,
+    thinking_budget=10000,
+    max_retries=0,
+    timeout=180,
 )
 
 
@@ -43,13 +58,13 @@ llm = ChatAnthropic(
 # ---------------------------------------------------------------------------
 
 MAX_RETRIES = 5
-BASE_DELAY = 20  # seconds — rate limit window is 60s, so 20s is a safe first wait
+BASE_DELAY = 15  # seconds
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
-    """Detect whether an exception is a 429 rate-limit error."""
-    # 1. Check by exception type (anthropic SDK raises RateLimitError)
-    if AnthropicRateLimitError and isinstance(exc, AnthropicRateLimitError):
+    """Detect whether an exception is a rate-limit error (429 / ResourceExhausted)."""
+    # 1. Google AI SDK raises google.api_core.exceptions.ResourceExhausted
+    if GoogleRateLimitError and isinstance(exc, GoogleRateLimitError):
         return True
     # 2. Check the HTTP status code if available (langchain wrappers)
     status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
@@ -57,7 +72,7 @@ def _is_rate_limit_error(exc: Exception) -> bool:
         return True
     # 3. Fallback: string matching on error message
     error_str = str(exc).lower()
-    return "429" in error_str or "rate_limit" in error_str
+    return "429" in error_str or "rate_limit" in error_str or "resource_exhausted" in error_str
 
 
 def _invoke_with_backoff(llm_instance, messages):
@@ -304,7 +319,7 @@ def _schedule_to_text(week_data):
 def process_uploaded_file(filename: str, file_bytes: bytes) -> str:
     """
     Process an uploaded file and extract actionable task text.
-    Handles .txt, .pdf (via pypdf), and images (via Claude vision).
+    Handles .txt, .pdf (via pypdf), and images (via Gemini vision).
     """
     ext = filename.rsplit(".", 1)[-1].lower()
 
@@ -317,9 +332,14 @@ def process_uploaded_file(filename: str, file_bytes: bytes) -> str:
         if not text.strip():
             return "(PDF contained no extractable text)"
         response = _invoke_with_backoff(llm, [HumanMessage(content=(
-            "Extract all actionable tasks, deadlines, and to-do items "
-            "from this document text. Return only the extracted tasks "
-            "as a bullet-point list.\n\n" + text
+            "CRITICAL: Extract EVERY single task, event, class, appointment, "
+            "deadline, and to-do item from this document.\n\n"
+            "Rules:\n"
+            "1. Preserve EXACT names — do NOT summarize, paraphrase, or merge.\n"
+            "2. Include ALL time, day, date, and location information.\n"
+            "3. Number each extracted item.\n"
+            "4. Do NOT skip any items.\n\n"
+            "Document text:\n" + text
         ))])
         return extract_text(response.content)
 
@@ -338,8 +358,16 @@ def process_uploaded_file(filename: str, file_bytes: bytes) -> str:
             {
                 "type": "text",
                 "text": (
-                    "Extract all actionable tasks, deadlines, and to-do items "
-                    "visible in this image. Return them as a bullet-point list."
+                    "CRITICAL: Read this image VERY carefully and extract EVERY single item you can see.\n\n"
+                    "Rules:\n"
+                    "1. Extract EVERY task, event, class, appointment, deadline, and to-do item visible.\n"
+                    "2. Preserve the EXACT names as written — do NOT summarize, paraphrase, or merge items.\n"
+                    "   Example: if the image says 'Calculus II lecture' write exactly 'Calculus II lecture', NOT 'University class'.\n"
+                    "3. Include ALL time information (days, hours, dates) exactly as shown.\n"
+                    "4. Include ALL location information exactly as shown.\n"
+                    "5. If it's a weekly schedule/timetable, list EVERY entry for EVERY day.\n"
+                    "6. Number each extracted item.\n\n"
+                    "Return a numbered list. Do NOT skip any items. Do NOT generalize."
                 ),
             },
         ])])
@@ -597,7 +625,17 @@ The user is currently located at: {user_location}
 THE PLANNING WEEK (7 days starting today):
 {week_display}
 
-Analyze these raw tasks: "{raw_tasks}"
+=== RAW INPUT (user tasks + uploaded documents) ===
+{raw_tasks}
+=== END RAW INPUT ===
+
+CRITICAL RULES — VIOLATIONS WILL CAUSE ERRORS:
+1. You MUST create one JSON entry for EVERY SINGLE task/event/class/appointment in the input above.
+2. PRESERVE EXACT NAMES. If the input says "Calculus II lecture", the task field must be "Calculus II lecture" — NOT "University class" or "Math" or any summary.
+3. NEVER merge multiple tasks into one. "Gym" and "Grocery shopping" = 2 separate entries.
+4. NEVER skip tasks. If the input has 15 items, your output must have at least 15 entries (more if recurring tasks expand to multiple days).
+5. Recurring tasks (e.g. "gym Mon/Wed/Fri", a class that meets Tue/Thu) must set is_recurring=true and list ALL day names in recurrence_days.
+6. If a task from an uploaded document/photo specifies a day and time, preserve that EXACTLY in preferred_day and deadline.
 
 For each task:
 - Estimate a reasonable duration in minutes.
@@ -615,8 +653,21 @@ For example, if the user is in Bucuresti and says "Mega Image at Alba Iulia",
 output "Mega Image, Piata Alba Iulia, Bucuresti" — NOT the city of Alba Iulia
 in Transylvania. Always resolve ambiguous locations to the nearest local match.
 
-Return ONLY a valid JSON list of objects — no markdown, no code fences:
-[{{"task": "name", "duration": 60, "priority": 1, "deadline": "HH:MM or null", "location": "full disambiguated address or null", "preferred_day": "Monday or null", "is_recurring": false, "recurrence_days": [], "date_deadline": "YYYY-MM-DD or null"}}]"""
+Return ONLY a valid JSON list of objects — no markdown, no code fences, no explanation:
+[{{"task": "EXACT name from input", "duration": 60, "priority": 1, "deadline": "HH:MM or null", "location": "full disambiguated address or null", "preferred_day": "Monday or null", "is_recurring": false, "recurrence_days": [], "date_deadline": "YYYY-MM-DD or null", "goal_id": null}}]"""
+
+    # Append macro-goal tagging instructions if the user set goals
+    macro_goals = state.get("macro_goals", [])
+    if macro_goals:
+        goals_numbered = "\n".join(f"  {i}. {g}" for i, g in enumerate(macro_goals))
+        prompt += f"""
+
+MACRO-GOAL TAGGING:
+The user has set these weekly goals:
+{goals_numbered}
+For each task, determine if it contributes to one of these goals.
+Set "goal_id" to the goal number (0-indexed) if the task matches, or null if unrelated.
+Example: if goal 0 is "Finish Physics Project" and a task is "Study physics chapter 5", set "goal_id": 0."""
 
     response = _invoke_with_backoff(llm, [HumanMessage(content=prompt)])
 
@@ -624,13 +675,27 @@ Return ONLY a valid JSON list of objects — no markdown, no code fences:
         raw_text = extract_text(response.content)
         cleaned = raw_text.strip().strip("`").removeprefix("json").strip()
         parsed_tasks = json.loads(cleaned)
-    except (json.JSONDecodeError, AttributeError) as e:
-        print(f"  Warning: could not parse task JSON ({e}). Using fallback.")
-        parsed_tasks = [
-            {"task": raw_tasks, "duration": 60, "priority": 5, "deadline": None,
-             "location": None, "preferred_day": None, "is_recurring": False,
-             "recurrence_days": [], "date_deadline": None}
-        ]
+        if not isinstance(parsed_tasks, list):
+            raise ValueError("Expected a JSON list")
+    except (json.JSONDecodeError, AttributeError, ValueError):
+        # Fallback: scan for JSON arrays in mixed output
+        try:
+            start = raw_text.index("[")
+            end = raw_text.rindex("]") + 1
+            parsed_tasks = json.loads(raw_text[start:end])
+        except (ValueError, json.JSONDecodeError):
+            # Last resort: look for JSON objects and wrap in list
+            objs = _find_all_json_objects(raw_text)
+            task_objs = [o for o in objs if "task" in o]
+            if task_objs:
+                parsed_tasks = task_objs
+            else:
+                print(f"  Warning: could not parse task JSON. Using fallback.")
+                parsed_tasks = [
+                    {"task": raw_tasks, "duration": 60, "priority": 5, "deadline": None,
+                     "location": None, "preferred_day": None, "is_recurring": False,
+                     "recurrence_days": [], "date_deadline": None}
+                ]
 
     summary_msg = HumanMessage(
         content=f"[Task Ingester] Parsed {len(parsed_tasks)} tasks at {now}:\n"
@@ -681,57 +746,95 @@ def scheduler(state: SchedulerState):
     critique_section = critique if critique else "None — this is the first draft."
     week_display = "\n".join(f"  - {d['display']} ({d['date_str']})" for d in week)
 
-    prompt = f"""You are an expert productivity scheduler planning a FULL 7-DAY WEEK.
-The current time is: {now}
+    # Build explicit task checklist so the LLM can't miss any
+    task_checklist = []
+    total_task_slots = 0
+    for i, t in enumerate(parsed_tasks, 1):
+        name = t.get("task", "Untitled")
+        pday = t.get("preferred_day")
+        recurring = t.get("is_recurring", False)
+        rec_days = t.get("recurrence_days", [])
+        deadline = t.get("date_deadline")
+        dur = t.get("duration", 60)
 
-USER'S CURRENT LOCATION: {user_location}
+        day_info = ""
+        if recurring and rec_days:
+            day_info = f" [RECURRING: {', '.join(rec_days)}]"
+            total_task_slots += len(rec_days)
+        elif pday:
+            day_info = f" [preferred: {pday}]"
+            total_task_slots += 1
+        else:
+            total_task_slots += 1
 
-THE PLANNING WEEK:
+        dl_info = f" [DEADLINE: {deadline}]" if deadline else ""
+        task_checklist.append(f"  {i}. {name} ({dur}min){day_info}{dl_info}")
+
+    task_checklist_str = "\n".join(task_checklist)
+
+    prompt = f"""You are an expert productivity scheduler. Your job is to create a DETAILED, COMPLETE 7-day weekly schedule.
+
+Current time: {now}
+User location: {user_location}
+
+PLANNING WEEK:
 {week_display}
 
-TASKS TO SCHEDULE:
+======================================================================
+TASK CHECKLIST — You MUST schedule ALL of these. Do NOT skip any.
+======================================================================
+{task_checklist_str}
+
+Total: {len(parsed_tasks)} unique tasks, {total_task_slots} minimum time slots needed.
+======================================================================
+
+FULL TASK DATA:
 {json.dumps(parsed_tasks, indent=2)}
 
 PREVIOUS CRITIQUE TO ADDRESS:
 {critique_section}
 
-SCHEDULING HIERARCHY (in strict order of precedence):
-1. Hard deadlines (date_deadline) and fixed appointments are ABSOLUTE — never violate them.
-2. Direct instructions from the user's critique (e.g. "Move gym to Wednesday") override all other logic.
-3. Tasks with preferred_day should be placed on that day when possible.
-4. Recurring tasks (is_recurring=true) must appear on ALL their recurrence_days.
-5. Only when time is flexible should you sort by the 1-10 priority scale.
-6. Do NOT arrive at locations more than 15 minutes early — time travel precisely.
+CRITICAL RULES — FAILURE TO FOLLOW = INVALID SCHEDULE:
+1. EVERY task in the checklist above MUST appear in your output. Count them.
+2. Use the EXACT task name from the checklist — do NOT rename, summarize, or merge tasks.
+3. Recurring tasks MUST appear on EVERY one of their recurrence_days.
+4. Your output must have at least {total_task_slots} task entries (not counting breaks/travel).
+5. If a task has a date_deadline, schedule it on or before that date.
+6. If a task has a preferred_day, schedule it on that day.
+
+SCHEDULING HIERARCHY (strict precedence):
+1. Hard deadlines (date_deadline) and fixed appointments — ABSOLUTE, never violate.
+2. User critique instructions (e.g. "Move gym to Wednesday") — override all other logic.
+3. preferred_day assignments — respect when possible.
+4. Recurring tasks — must appear on ALL their recurrence_days.
+5. Priority scale (1=highest, 10=lowest) — only for flexible time ordering.
+6. Do NOT arrive at locations more than 15 minutes early.
 
 WEEKLY PLANNING RULES:
-1. TODAY ({week[0]['display']}): Start from NOW ({now}). Do NOT use a generic 9-to-5 template.
-2. FUTURE DAYS: Plan from 08:00 to 23:00 (respect sleep boundaries — no tasks before 07:00 or after 23:30).
+1. TODAY ({week[0]['display']}): Start from NOW ({now}). Do NOT use a generic morning start.
+2. FUTURE DAYS: Plan from 08:00 to 23:00. No tasks before 07:00 or after 23:30.
 3. Include 5-10 minute breaks between tasks.
-4. ONLY schedule the tasks listed above — do not invent new ones.
-5. Do NOT create oversized buffer blocks. Once a task is done, move to the next one.
-6. Balance workload across the week — avoid stacking everything on one day.
+4. ONLY schedule the tasks from the checklist — do NOT invent new tasks.
+5. Do NOT create oversized buffer blocks.
+6. Balance workload across the week — spread tasks, don't stack on one day.
 7. Group location-based tasks on the same day to minimize commute.
-8. Place high-priority tasks earlier in the week when possible.
-9. Recurring tasks (e.g. gym Mon/Wed/Fri) must appear on each specified day.
-10. If a task has a date_deadline, it MUST be completed on or before that date.
+8. Place high-priority tasks earlier in the week.
 
 MANDATORY TOOL USAGE:
-Before generating the schedule, you MUST call the following tools:
-- Call get_weekly_forecast(location="{user_location}") to get the 7-day weather outlook. Use this to plan outdoor activities on good-weather days.
-- For ANY task with a non-null "location" field, call estimate_commute(origin="{user_location}", destination=<task location>) to get realistic travel time.
-- For ANY outdoor or physical task (gym, sports, walking, park, etc.), call get_weather(location="{user_location}") for current conditions (today's tasks).
-Do NOT skip tool calls. Call the tools FIRST, then build the schedule using their results.
+Before generating the schedule, call these tools:
+- get_weekly_forecast(location="{user_location}") for 7-day weather
+- estimate_commute(origin="{user_location}", destination=<location>) for EACH task with a location
+- get_weather(location="{user_location}") for today's outdoor/physical tasks
+Call tools FIRST, then build the schedule using their results.
 
-OUTPUT FORMAT:
-Return ONLY a valid JSON object — no markdown fences, no text before or after.
-The object is keyed by day name, each value is an array of scheduled blocks:
+OUTPUT FORMAT — Return ONLY valid JSON, no markdown fences, no text before/after:
+{{"Monday": [{{"start":"HH:MM","end":"HH:MM","title":"EXACT Task Name","type":"work|break|travel|fitness|call|errand|meal|shower","priority":1,"duration_min":60,"location":"place or null","notes":"context or null","weather":"brief note or null","commute":"travel info or null","goal_id":null}}], "Tuesday": [...], ...}}
 
-{{"Monday": [{{"start":"HH:MM","end":"HH:MM","title":"Task Name","type":"work|break|travel|fitness|call|errand|meal|shower","priority":1,"duration_min":60,"location":"place or null","notes":"1-line context or null","weather":"brief weather note or null","commute":"travel info or null"}}], "Tuesday": [...], ...}}
-
-Include ALL 7 days of the week ({', '.join(d['day_name'] for d in week)}).
-Days with no tasks should still appear with an empty array.
-type must be one of: work, break, travel, fitness, call, errand, meal, shower.
-priority is 1-10 for real tasks, null for breaks/travel."""
+Include ALL 7 days: {', '.join(d['day_name'] for d in week)}.
+Empty days get an empty array [].
+type: work, break, travel, fitness, call, errand, meal, shower.
+priority: 1-10 for tasks, null for breaks/travel.
+goal_id: copy from the task data — integer index or null."""
 
     human_msg = HumanMessage(content=prompt)
     response = _invoke_with_backoff(llm_with_tools, messages + [human_msg])
@@ -770,6 +873,19 @@ def critic(state: SchedulerState):
 
     week_display = "\n".join(f"  - {d['display']} ({d['date_str']})" for d in week)
 
+    # Build a task name checklist for the critic to verify against
+    task_names = []
+    for t in parsed_tasks:
+        name = t.get("task", "Untitled")
+        recurring = t.get("is_recurring", False)
+        rec_days = t.get("recurrence_days", [])
+        if recurring and rec_days:
+            for day in rec_days:
+                task_names.append(f"  - {name} (on {day})")
+        else:
+            task_names.append(f"  - {name}")
+    task_names_str = "\n".join(task_names)
+
     prompt = f"""You are a strict productivity critic evaluating a WEEKLY schedule.
 The current time is: {now}
 
@@ -779,26 +895,33 @@ THE PLANNING WEEK:
 PROPOSED WEEKLY SCHEDULE:
 {draft_schedule}
 
-ORIGINAL TASKS:
+======================================================================
+REQUIRED TASKS — Every one of these MUST appear in the schedule:
+{task_names_str}
+Total required entries: {len(task_names)}
+======================================================================
+
+ORIGINAL TASK DATA:
 {json.dumps(parsed_tasks, indent=2)}
 
-Evaluate against these criteria:
-1. COMPLETENESS: Are ALL tasks included? None should be missing. Recurring tasks must appear on every specified recurrence day.
-2. DEADLINES: Are all date_deadline constraints met? Tasks must be scheduled on or before their deadline date.
-3. DAY PREFERENCES: Are preferred_day assignments respected?
-4. WORKLOAD BALANCE: Is the work spread reasonably across the week? No single day should be overloaded while others are empty.
-5. TODAY'S SCHEDULE: Does today's plan start from the current time, not a generic morning?
-6. SLEEP BOUNDARIES: No tasks scheduled before 07:00 or after 23:30.
-7. PRIORITY ORDER: Within each day, are high-priority tasks (closest to 1) scheduled earlier?
-8. TRAVEL LOGIC: Tasks with locations have realistic commute time? Location-based tasks grouped on same days?
-9. BREAKS: Are there reasonable breaks between tasks?
+EVALUATION STEPS — Do these IN ORDER:
+1. COMPLETENESS CHECK: Go through the required tasks list above one by one. For EACH task, verify it appears in the schedule with its EXACT name. List any missing tasks. This is the MOST IMPORTANT criterion.
+2. TASK COUNT: Count the actual task entries (excluding breaks/travel) in the schedule. If fewer than {len(task_names)}, the schedule is INCOMPLETE.
+3. DEADLINES: Are all date_deadline constraints met?
+4. DAY PREFERENCES: Are preferred_day assignments respected?
+5. WORKLOAD BALANCE: Is work spread across the week? No single day overloaded while others empty.
+6. TODAY'S SCHEDULE: Does today start from current time ({now}), not a generic morning?
+7. SLEEP BOUNDARIES: No tasks before 07:00 or after 23:30.
+8. PRIORITY ORDER: High-priority tasks (1) scheduled earlier within each day?
+9. TRAVEL LOGIC: Tasks with locations have commute time? Location-based tasks grouped?
+10. BREAKS: Reasonable breaks between tasks?
 
 This is revision {revision_count} of 7.
 
-If the schedule meets ALL criteria, reply with EXACTLY the word: PERFECT
-Otherwise, provide a concise bulleted list of specific changes needed."""
+If ALL criteria are met (especially completeness — ALL tasks present), reply with EXACTLY: PERFECT
+Otherwise, provide a concise bulleted list of specific changes. If tasks are MISSING, list them explicitly."""
 
-    response = _invoke_with_backoff(llm, [HumanMessage(content=prompt)])
+    response = _invoke_with_backoff(llm_thinking, [HumanMessage(content=prompt)])
     critique_text = extract_text(response.content).strip()
 
     critic_log = HumanMessage(
@@ -851,3 +974,97 @@ def human_review(state: SchedulerState):
             "critique": f"USER REQUESTED CHANGES: {feedback_str}",
             "messages": [HumanMessage(content=f"[Human Feedback] {feedback_str}")],
         }
+
+
+# ---------------------------------------------------------------------------
+# Node 5: Reschedule Agent — dynamic "I'm Behind" rescheduler
+# ---------------------------------------------------------------------------
+
+def reschedule_agent(state: RescheduleState):
+    """
+    Triggered when the user clicks "I'm Behind". Takes remaining unchecked
+    tasks for today, compresses the rest of the day, and pushes low-priority
+    tasks to tomorrow if needed.
+    """
+    print("\n--- DYNAMIC RESCHEDULER ---")
+    current_time = state.get("current_time", "12:00")
+    user_location = state.get("user_location", "Home")
+    today_name = state.get("today_name", "Today")
+    tomorrow_name = state.get("tomorrow_name", "Tomorrow")
+    remaining_tasks = state.get("remaining_tasks", [])
+    tomorrow_schedule = state.get("tomorrow_schedule", [])
+
+    if not remaining_tasks:
+        print("  No remaining tasks to reschedule.")
+        return {
+            "rescheduled_today": [],
+            "rescheduled_tomorrow": tomorrow_schedule,
+            "messages": [HumanMessage(content="[Rescheduler] No tasks remaining.")],
+        }
+
+    prompt = f"""You are an emergency schedule optimizer. The user is BEHIND on their tasks.
+
+CURRENT TIME: {current_time}
+TODAY: {today_name}
+TOMORROW: {tomorrow_name}
+LOCATION: {user_location}
+
+REMAINING UNCHECKED TASKS FOR TODAY (not yet started or completed):
+{json.dumps(remaining_tasks, indent=2)}
+
+TOMORROW'S CURRENT SCHEDULE:
+{json.dumps(tomorrow_schedule, indent=2)}
+
+YOUR MISSION — Rebuild the rest of today starting from {current_time}:
+
+RULES (strict priority order):
+1. Priority 1-3 tasks MUST stay today. These are non-negotiable.
+2. Compress or remove ALL breaks to 5 minutes max.
+3. Remove any buffer/padding time.
+4. If tasks still don't fit before 23:30:
+   a. Push priority 7-10 tasks to tomorrow.
+   b. Push priority 4-6 tasks to tomorrow only as a last resort.
+   c. NEVER push priority 1-3 tasks to tomorrow.
+5. Pushed tasks go at the END of tomorrow's schedule.
+6. Preserve exact task titles and goal_id values.
+7. Respect sleep boundary: no tasks after 23:30.
+
+OUTPUT FORMAT — Return ONLY valid JSON with two keys:
+{{"rescheduled_today": [{{"start":"HH:MM","end":"HH:MM","title":"Task Name","type":"work|break|travel|fitness|call|errand|meal|shower","priority":1,"duration_min":60,"location":"place or null","notes":"context or null","goal_id":null}}], "rescheduled_tomorrow": [{{"start":"HH:MM","end":"HH:MM","title":"Task Name","type":"...","priority":1,"duration_min":60,"location":"place or null","notes":"context or null","goal_id":null}}]}}
+
+No markdown fences, no explanation text."""
+
+    response = _invoke_with_backoff(llm, [HumanMessage(content=prompt)])
+    raw_text = extract_text(response.content)
+
+    # Parse the response
+    rescheduled_today = []
+    rescheduled_tomorrow = tomorrow_schedule
+
+    try:
+        cleaned = raw_text.strip().strip("`").removeprefix("json").strip()
+        data = json.loads(cleaned)
+        if isinstance(data, dict):
+            rescheduled_today = data.get("rescheduled_today", [])
+            rescheduled_tomorrow = data.get("rescheduled_tomorrow", tomorrow_schedule)
+    except (json.JSONDecodeError, TypeError):
+        # Fallback: try brace-depth scanner
+        objs = _find_all_json_objects(raw_text)
+        for obj in objs:
+            if "rescheduled_today" in obj:
+                rescheduled_today = obj.get("rescheduled_today", [])
+                rescheduled_tomorrow = obj.get("rescheduled_tomorrow", tomorrow_schedule)
+                break
+
+    pushed_count = len(rescheduled_tomorrow) - len(tomorrow_schedule)
+    print(f"  Rescheduled: {len(rescheduled_today)} tasks today, "
+          f"{pushed_count} pushed to tomorrow.")
+
+    return {
+        "rescheduled_today": rescheduled_today,
+        "rescheduled_tomorrow": rescheduled_tomorrow,
+        "messages": [HumanMessage(
+            content=f"[Rescheduler] Rebuilt rest of {today_name}: "
+                    f"{len(rescheduled_today)} tasks, {pushed_count} pushed to {tomorrow_name}."
+        )],
+    }

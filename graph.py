@@ -6,7 +6,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
-from state import SchedulerState
+from state import SchedulerState, RescheduleState
 from nodes import (
     document_processor,
     task_ingester,
@@ -15,6 +15,7 @@ from nodes import (
     human_review,
     tool_node,
     resolve_timezone,
+    reschedule_agent,
 )
 
 
@@ -110,6 +111,22 @@ def build_graph(sqlite_conn=None):
     return workflow.compile()
 
 
+def build_reschedule_graph(sqlite_conn=None):
+    """
+    Build a minimal single-node graph for the dynamic "I'm Behind" rescheduler.
+    START -> reschedule_agent -> END
+    """
+    workflow = StateGraph(RescheduleState)
+    workflow.add_node("reschedule_agent", reschedule_agent)
+    workflow.add_edge(START, "reschedule_agent")
+    workflow.add_edge("reschedule_agent", END)
+
+    if sqlite_conn:
+        memory = SqliteSaver(sqlite_conn)
+        return workflow.compile(checkpointer=memory)
+    return workflow.compile()
+
+
 # ---------------------------------------------------------------------------
 # Main execution loop with HITL interrupt handling (terminal mode)
 # ---------------------------------------------------------------------------
@@ -117,7 +134,7 @@ def build_graph(sqlite_conn=None):
 if __name__ == "__main__":
     print("=" * 55)
     print("   AI WEEKLY SCHEDULE OPTIMIZER")
-    print("   Powered by Claude Haiku + LangGraph")
+    print("   Powered by Gemini 2.5 Pro + LangGraph")
     print("=" * 55)
 
     sqlite_conn = sqlite3.connect(DB_PATH, check_same_thread=False)

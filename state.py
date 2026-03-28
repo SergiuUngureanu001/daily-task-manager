@@ -27,7 +27,7 @@ class SchedulerState(TypedDict):
     # Structured list of tasks after the AI processes them
     # Each task may include: task, duration, priority, deadline, location,
     # preferred_day (str|null), is_recurring (bool), recurrence_days (list),
-    # date_deadline (str|null "YYYY-MM-DD")
+    # date_deadline (str|null "YYYY-MM-DD"), goal_id (int|null)
     parsed_tasks: List[Dict[str, Any]]
 
     # The readable text version of the weekly plan
@@ -49,3 +49,46 @@ class SchedulerState(TypedDict):
 
     # Stores the human's response during the HITL interrupt
     human_feedback: str
+
+    # 1-3 weekly macro-goals (e.g. ["Finish Physics Project", "Gym 3x"])
+    macro_goals: List[str]
+
+
+class RescheduleState(TypedDict):
+    """
+    State for the dynamic rescheduler graph — triggered when the user
+    clicks "I'm Behind". Produces a compressed rest-of-day schedule.
+    """
+
+    # Current time as HH:MM string
+    current_time: str
+
+    # User's IANA timezone
+    user_timezone: str
+
+    # User's location for context
+    user_location: str
+
+    # Today's day name (e.g. "Monday")
+    today_name: str
+
+    # Tomorrow's day name (e.g. "Tuesday")
+    tomorrow_name: str
+
+    # Remaining unchecked tasks for today (list of schedule entry dicts)
+    remaining_tasks: List[Dict[str, Any]]
+
+    # Tomorrow's current schedule entries
+    tomorrow_schedule: List[Dict[str, Any]]
+
+    # All parsed tasks (for priority reference)
+    parsed_tasks: List[Dict[str, Any]]
+
+    # Output: rescheduled rest-of-today entries
+    rescheduled_today: List[Dict[str, Any]]
+
+    # Output: updated tomorrow entries (low-priority tasks pushed here)
+    rescheduled_tomorrow: List[Dict[str, Any]]
+
+    # Conversation log
+    messages: Annotated[list, add_messages]

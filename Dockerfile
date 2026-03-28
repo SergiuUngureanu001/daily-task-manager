@@ -10,7 +10,7 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY state.py nodes.py graph.py app.py ./
+COPY state.py nodes.py graph.py app.py session_store.py ./
 
 EXPOSE 8501
 
