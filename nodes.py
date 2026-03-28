@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import time
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -14,6 +15,11 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 from pypdf import PdfReader
 
+try:
+    from anthropic import RateLimitError as AnthropicRateLimitError
+except ImportError:
+    AnthropicRateLimitError = None
+
 from state import SchedulerState
 
 load_dotenv(override=True)
@@ -23,11 +29,54 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 # ---------------------------------------------------------------------------
 # LLM setup — Claude Haiku via Anthropic API
 # ---------------------------------------------------------------------------
+# max_retries=0 disables the SDK's own fast retries for rate limits — we handle
+# backoff ourselves in _invoke_with_backoff with longer, smarter delays.
 llm = ChatAnthropic(
     model="claude-haiku-4-5-20251001",
-    max_retries=3,
+    max_retries=0,
     timeout=120,
 )
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit-aware LLM invoke wrapper with exponential backoff
+# ---------------------------------------------------------------------------
+
+MAX_RETRIES = 5
+BASE_DELAY = 20  # seconds — rate limit window is 60s, so 20s is a safe first wait
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Detect whether an exception is a 429 rate-limit error."""
+    # 1. Check by exception type (anthropic SDK raises RateLimitError)
+    if AnthropicRateLimitError and isinstance(exc, AnthropicRateLimitError):
+        return True
+    # 2. Check the HTTP status code if available (langchain wrappers)
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status == 429:
+        return True
+    # 3. Fallback: string matching on error message
+    error_str = str(exc).lower()
+    return "429" in error_str or "rate_limit" in error_str
+
+
+def _invoke_with_backoff(llm_instance, messages):
+    """
+    Call llm_instance.invoke(messages) with automatic retry on 429 rate-limit
+    errors. Uses exponential backoff: 20s, 40s, 80s, 160s, 320s.
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return llm_instance.invoke(messages)
+        except Exception as e:
+            if _is_rate_limit_error(e) and attempt < MAX_RETRIES:
+                delay = BASE_DELAY * (2 ** (attempt - 1))
+                print(f"    [Rate limit] Attempt {attempt}/{MAX_RETRIES} — "
+                      f"waiting {delay}s before retry...")
+                time.sleep(delay)
+                continue
+            # Not a rate limit error, or out of retries — raise
+            raise
 
 
 def extract_text(content) -> str:
@@ -109,36 +158,101 @@ def _week_dates(state) -> list[dict]:
 # Schedule JSON parsing helpers (weekly format)
 # ---------------------------------------------------------------------------
 
+def _find_all_json_objects(text: str) -> list[dict]:
+    """
+    Scan text for every top-level JSON object ({...}) and return all that
+    parse successfully. Handles LLM outputs with reasoning text mixed
+    between multiple JSON blocks.
+    """
+    results = []
+    i = 0
+    while i < len(text):
+        if text[i] == "{":
+            # Track brace nesting to find the matching close brace
+            depth = 0
+            in_string = False
+            escape_next = False
+            for j in range(i, len(text)):
+                ch = text[j]
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == "\\":
+                    if in_string:
+                        escape_next = True
+                    continue
+                if ch == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[i:j + 1]
+                        try:
+                            data = json.loads(candidate)
+                            if isinstance(data, dict):
+                                results.append(data)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                        break
+            i = j + 1 if depth == 0 else i + 1
+        else:
+            i += 1
+    return results
+
+
+def _is_weekly_schedule(data: dict) -> bool:
+    """Check if a dict looks like a weekly schedule (day names mapping to lists)."""
+    if not data:
+        return False
+    day_names = {"monday", "tuesday", "wednesday", "thursday", "friday",
+                 "saturday", "sunday", "today"}
+    matching = sum(1 for k in data if k.lower() in day_names)
+    return matching >= 1 and all(isinstance(v, list) for v in data.values())
+
+
 def _parse_schedule_response(response_content):
     """
     Parse the scheduler's LLM response into (structured_dict, text_version).
     The structured_dict is keyed by day name: {"Monday": [...], "Tuesday": [...]}.
-    Falls back to ({}, raw_text) if JSON extraction fails.
+    Handles messy LLM outputs with reasoning text mixed between JSON blocks.
+    Falls back to ({}, raw_text) if all extraction attempts fail.
     """
     raw = extract_text(response_content)
 
-    # Try direct JSON parse (clean response)
+    # Try direct JSON parse (clean response — no surrounding text)
     for attempt in [raw, raw.strip().strip("`").removeprefix("json").strip()]:
         try:
             data = json.loads(attempt)
             if isinstance(data, dict):
                 return data, _schedule_to_text(data)
-            # If the LLM returns a flat list, wrap it under "Today"
             if isinstance(data, list):
                 wrapped = {"Today": data}
                 return wrapped, _schedule_to_text(wrapped)
         except (json.JSONDecodeError, TypeError):
             continue
 
-    # Try to extract a JSON object from mixed text
-    try:
-        start = raw.index("{")
-        end = raw.rindex("}") + 1
-        data = json.loads(raw[start:end])
-        if isinstance(data, dict):
-            return data, _schedule_to_text(data)
-    except (ValueError, json.JSONDecodeError):
-        pass
+    # Extract all JSON objects from mixed text and pick the best one.
+    # The LLM often outputs reasoning, a first draft, corrections, then
+    # a final JSON — so we prefer the LAST valid weekly schedule object,
+    # and among those the LARGEST (most days/entries).
+    candidates = _find_all_json_objects(raw)
+    weekly_candidates = [c for c in candidates if _is_weekly_schedule(c)]
+    if weekly_candidates:
+        # Prefer the last one (the corrected/final version)
+        best = weekly_candidates[-1]
+        print(f"  Extracted weekly schedule: {list(best.keys())} "
+              f"({sum(len(v) for v in best.values() if isinstance(v, list))} entries)")
+        return best, _schedule_to_text(best)
+
+    # If no weekly dict found, try any dict candidate
+    if candidates:
+        best = candidates[-1]
+        return best, _schedule_to_text(best)
 
     # Try to extract a JSON array (legacy single-day format)
     try:
@@ -202,7 +316,7 @@ def process_uploaded_file(filename: str, file_bytes: bytes) -> str:
         text = "\n".join(page.extract_text() or "" for page in reader.pages)
         if not text.strip():
             return "(PDF contained no extractable text)"
-        response = llm.invoke([HumanMessage(content=(
+        response = _invoke_with_backoff(llm, [HumanMessage(content=(
             "Extract all actionable tasks, deadlines, and to-do items "
             "from this document text. Return only the extracted tasks "
             "as a bullet-point list.\n\n" + text
@@ -212,7 +326,7 @@ def process_uploaded_file(filename: str, file_bytes: bytes) -> str:
     elif ext in ("png", "jpg", "jpeg"):
         b64 = base64.b64encode(file_bytes).decode("utf-8")
         media_type = "image/png" if ext == "png" else "image/jpeg"
-        response = llm.invoke([HumanMessage(content=[
+        response = _invoke_with_backoff(llm, [HumanMessage(content=[
             {
                 "type": "image",
                 "source": {
@@ -504,7 +618,7 @@ in Transylvania. Always resolve ambiguous locations to the nearest local match.
 Return ONLY a valid JSON list of objects — no markdown, no code fences:
 [{{"task": "name", "duration": 60, "priority": 1, "deadline": "HH:MM or null", "location": "full disambiguated address or null", "preferred_day": "Monday or null", "is_recurring": false, "recurrence_days": [], "date_deadline": "YYYY-MM-DD or null"}}]"""
 
-    response = llm.invoke([HumanMessage(content=prompt)])
+    response = _invoke_with_backoff(llm, [HumanMessage(content=prompt)])
 
     try:
         raw_text = extract_text(response.content)
@@ -546,7 +660,7 @@ def scheduler(state: SchedulerState):
 
     # ---- Continuation after tool execution ----
     if messages and isinstance(messages[-1], ToolMessage):
-        response = llm_with_tools.invoke(messages)
+        response = _invoke_with_backoff(llm_with_tools, messages)
         has_more_tool_calls = bool(getattr(response, "tool_calls", None))
         if has_more_tool_calls:
             return {"messages": [response]}
@@ -620,7 +734,7 @@ type must be one of: work, break, travel, fitness, call, errand, meal, shower.
 priority is 1-10 for real tasks, null for breaks/travel."""
 
     human_msg = HumanMessage(content=prompt)
-    response = llm_with_tools.invoke(messages + [human_msg])
+    response = _invoke_with_backoff(llm_with_tools, messages + [human_msg])
     has_tool_calls = bool(getattr(response, "tool_calls", None))
 
     if has_tool_calls:
@@ -684,7 +798,7 @@ This is revision {revision_count} of 7.
 If the schedule meets ALL criteria, reply with EXACTLY the word: PERFECT
 Otherwise, provide a concise bulleted list of specific changes needed."""
 
-    response = llm.invoke([HumanMessage(content=prompt)])
+    response = _invoke_with_backoff(llm, [HumanMessage(content=prompt)])
     critique_text = extract_text(response.content).strip()
 
     critic_log = HumanMessage(

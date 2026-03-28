@@ -3,11 +3,13 @@ Streamlit frontend for the AI Weekly Schedule Optimizer.
 Run with:  streamlit run app.py
 """
 
-import html as html_lib
+import io
+import json
 import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 import streamlit as st
 from langgraph.types import Command
 
@@ -25,65 +27,11 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Global CSS — injected once for card styling
+# Global CSS
 # ---------------------------------------------------------------------------
 
 st.markdown("""
 <style>
-/* Schedule card */
-.sched-card {
-    border-radius: 0.6rem;
-    padding: 1rem 1.2rem;
-    margin-bottom: 0.7rem;
-    background: rgba(255,255,255,0.03);
-    border: 1px solid rgba(250,250,250,0.08);
-}
-.sched-card .card-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-}
-.sched-card .card-title {
-    font-size: 1.15rem;
-    font-weight: 600;
-}
-.sched-card .card-time {
-    color: rgba(250,250,250,0.45);
-    font-size: 0.92rem;
-    font-weight: 500;
-}
-.sched-card .card-meta {
-    display: flex;
-    gap: 1.2rem;
-    color: rgba(250,250,250,0.45);
-    font-size: 0.85rem;
-    margin-top: 0.35rem;
-    flex-wrap: wrap;
-}
-.sched-card .card-notes {
-    color: rgba(250,250,250,0.55);
-    font-size: 0.9rem;
-    margin-top: 0.35rem;
-}
-.sched-card .card-badges {
-    display: flex;
-    gap: 0.45rem;
-    margin-top: 0.5rem;
-    flex-wrap: wrap;
-}
-.pri-badge {
-    padding: 0.12rem 0.55rem;
-    border-radius: 1rem;
-    font-size: 0.78rem;
-    font-weight: 600;
-}
-.tool-badge {
-    padding: 0.12rem 0.5rem;
-    border-radius: 0.45rem;
-    font-size: 0.78rem;
-}
 /* HITL review banner */
 .hitl-banner {
     background: linear-gradient(135deg, rgba(255,152,0,0.12), rgba(255,87,34,0.06));
@@ -102,25 +50,15 @@ st.markdown("""
     margin: 0;
     font-size: 0.92rem;
 }
-/* Day header in tabs */
-.day-header {
-    font-size: 0.85rem;
-    color: rgba(250,250,250,0.4);
-    margin-bottom: 0.5rem;
+/* Tighter spacing for task metadata under checkboxes */
+div[data-testid="stCaptionContainer"] {
+    margin-top: -0.6rem;
+    padding-left: 1.75rem;
 }
-/* Weekly overview cards */
-.week-overview {
-    display: flex;
-    gap: 0.5rem;
-    flex-wrap: wrap;
-    margin-bottom: 1rem;
-}
-.day-pill {
-    padding: 0.4rem 0.8rem;
-    border-radius: 0.5rem;
-    font-size: 0.82rem;
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(250,250,250,0.1);
+/* Completed task: strike-through via adjacent caption */
+.task-done {
+    text-decoration: line-through;
+    opacity: 0.5;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -163,129 +101,105 @@ TYPE_CONFIG = {
 DEFAULT_TYPE = {"icon": "\U0001f4cb", "label": "Task"}
 
 
-def _priority_style(p):
-    """Return color/bg/label for a priority value."""
-    if p is None:
-        return {"color": "#78909c", "bg": "rgba(120,144,156,0.15)", "label": "\u2014"}
-    if p <= 3:
-        return {"color": "#ff6b6b", "bg": "rgba(255,75,75,0.15)", "label": f"P{p}"}
-    if p <= 6:
-        return {"color": "#ffa726", "bg": "rgba(255,167,38,0.15)", "label": f"P{p}"}
-    return {"color": "#66bb6a", "bg": "rgba(102,187,106,0.15)", "label": f"P{p}"}
-
-
-def _border_color(p):
-    if p is None:
-        return "#78909c"
-    if p <= 3:
-        return "#ff4b4b"
-    if p <= 6:
-        return "#ffa726"
-    return "#66bb6a"
-
-
 # ---------------------------------------------------------------------------
-# Rendering helpers
+# Checkbox key helpers
 # ---------------------------------------------------------------------------
 
-def render_card(entry: dict):
-    """Render a single schedule entry as a styled HTML card."""
-    t = TYPE_CONFIG.get(entry.get("type", ""), DEFAULT_TYPE)
-    p = entry.get("priority")
-    ps = _priority_style(p)
-    bc = _border_color(p)
-    title = html_lib.escape(entry.get("title", "Untitled"))
-    start = html_lib.escape(str(entry.get("start", "?")))
-    end = html_lib.escape(str(entry.get("end", "?")))
-    dur = entry.get("duration_min", "?")
-    loc = entry.get("location")
-    notes = entry.get("notes")
-    weather = entry.get("weather")
-    commute = entry.get("commute")
-
-    # Build metadata spans
-    meta_parts = [f"\u23f1 {dur} min"]
-    if loc:
-        meta_parts.append(f"\U0001f4cd {html_lib.escape(loc)}")
-    meta_html = "".join(f"<span>{m}</span>" for m in meta_parts)
-
-    # Build badge spans
-    badges = []
-    if weather:
-        badges.append(
-            f'<span class="tool-badge" style="background:rgba(30,136,229,0.12);'
-            f'color:#64b5f6;">\U0001f324\ufe0f {html_lib.escape(weather)}</span>'
-        )
-    if commute:
-        badges.append(
-            f'<span class="tool-badge" style="background:rgba(255,167,38,0.12);'
-            f'color:#ffb74d;">\U0001f6a6 {html_lib.escape(commute)}</span>'
-        )
-    badges_html = "".join(badges)
-
-    # Notes
-    notes_html = ""
-    if notes:
-        notes_html = f'<div class="card-notes">{html_lib.escape(notes)}</div>'
-
-    # Priority badge
-    pri_html = (
-        f'<span class="pri-badge" style="background:{ps["bg"]};'
-        f'color:{ps["color"]};">{ps["label"]}</span>'
-    )
-
-    card = f"""
-    <div class="sched-card" style="border-left:4px solid {bc};">
-        <div class="card-row">
-            <span class="card-title">{t["icon"]} {title}</span>
-            <div style="display:flex;gap:0.6rem;align-items:center;">
-                {pri_html}
-                <span class="card-time">{start} \u2013 {end}</span>
-            </div>
-        </div>
-        <div class="card-meta">{meta_html}</div>
-        {notes_html}
-        <div class="card-badges">{badges_html}</div>
-    </div>
-    """
-    st.markdown(card, unsafe_allow_html=True)
+def _task_key(day: str, entry: dict, index: int) -> str:
+    """Generate a unique, stable session_state key for a task checkbox."""
+    title = entry.get("title", "task").replace(" ", "_")[:30]
+    start = entry.get("start", "00")
+    return f"chk_{day}_{index}_{start}_{title}"
 
 
-def render_weekly_metrics(schedule_data: dict):
-    """Render top-level weekly overview metrics from the structured schedule dict."""
-    if not schedule_data:
-        return
-
-    total_min = 0
-    total_tasks = 0
-    total_focus = 0
-    days_with_tasks = 0
-    weather_note = None
-
+def _init_checkbox_states(schedule_data: dict):
+    """Ensure every task checkbox has a session_state entry (default False)."""
     for day_name, entries in schedule_data.items():
         if not isinstance(entries, list):
             continue
-        real_tasks = [e for e in entries if e.get("type") not in ("break", "travel", "shower")]
-        if real_tasks:
-            days_with_tasks += 1
-        total_tasks += len(entries)
-        total_focus += len(real_tasks)
-        total_min += sum(e.get("duration_min", 0) for e in entries)
-        if not weather_note:
-            weather_note = next(
-                (e["weather"] for e in entries if e.get("weather")), None
-            )
+        for i, entry in enumerate(entries):
+            key = _task_key(day_name, entry, i)
+            if key not in st.session_state:
+                st.session_state[key] = False
 
-    hours, mins = divmod(total_min, 60)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Planned", f"{hours}h {mins}m", delta=f"{total_tasks} blocks")
-    c2.metric("Focus Tasks", str(total_focus), delta=f"across {days_with_tasks} days")
-    c3.metric("Days Planned", f"{days_with_tasks}/7")
-    if weather_note:
-        c4.metric("Weather", weather_note[:30])
-    else:
-        c4.metric("Weather", "N/A")
+def _clear_checkbox_states():
+    """Remove all checkbox keys from session_state (used on new session)."""
+    to_remove = [k for k in st.session_state if k.startswith("chk_")]
+    for k in to_remove:
+        del st.session_state[k]
+
+
+# ---------------------------------------------------------------------------
+# Priority formatting
+# ---------------------------------------------------------------------------
+
+def _priority_label(p):
+    if p is None:
+        return ""
+    if p <= 3:
+        return f"\U0001f534 P{p}"
+    if p <= 6:
+        return f"\U0001f7e0 P{p}"
+    return f"\U0001f7e2 P{p}"
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers — checkbox-based
+# ---------------------------------------------------------------------------
+
+def render_task_checkbox(entry: dict, day_name: str, index: int):
+    """Render a single task as an interactive checkbox with clean metadata."""
+    t = TYPE_CONFIG.get(entry.get("type", ""), DEFAULT_TYPE)
+    title = entry.get("title", "Untitled")
+    start = entry.get("start", "?")
+    end = entry.get("end", "?")
+
+    # Checkbox label: icon + time window + title
+    label = f"{t['icon']} {start} \u2013 {end} | {title}"
+
+    key = _task_key(day_name, entry, index)
+    checked = st.checkbox(label, value=st.session_state.get(key, False), key=key)
+
+    # Build metadata line
+    meta_parts = []
+    p = entry.get("priority")
+    if p is not None:
+        meta_parts.append(_priority_label(p))
+    dur = entry.get("duration_min")
+    if dur:
+        meta_parts.append(f"\u23f1 {dur} min")
+    loc = entry.get("location")
+    if loc:
+        meta_parts.append(f"\U0001f4cd {loc}")
+    weather = entry.get("weather")
+    if weather:
+        meta_parts.append(f"\U0001f324\ufe0f {weather}")
+    commute = entry.get("commute")
+    if commute:
+        meta_parts.append(f"\U0001f6a6 {commute}")
+    notes = entry.get("notes")
+    if notes:
+        meta_parts.append(f"\U0001f4dd {notes}")
+
+    if meta_parts:
+        meta_text = " | ".join(meta_parts)
+        if checked:
+            st.caption(f"~~{meta_text}~~")
+        else:
+            st.caption(meta_text)
+
+
+def render_day_progress(entries: list, day_name: str):
+    """Show a progress bar for how many tasks are checked off in a day."""
+    if not entries:
+        return
+    total = len(entries)
+    done = sum(
+        1 for i, e in enumerate(entries)
+        if st.session_state.get(_task_key(day_name, e, i), False)
+    )
+    st.progress(done / total if total else 0, text=f"{done}/{total} completed")
 
 
 def render_day_metrics(entries: list):
@@ -305,13 +219,56 @@ def render_day_metrics(entries: list):
     c3.metric("Ends At", end_time)
 
 
-def render_day_schedule(entries: list, fallback_text: str = ""):
-    """Render a single day's schedule with cards."""
+def render_weekly_metrics(schedule_data: dict):
+    """Render top-level weekly overview metrics."""
+    if not schedule_data:
+        return
+
+    total_min = 0
+    total_tasks = 0
+    total_focus = 0
+    total_checked = 0
+    days_with_tasks = 0
+    weather_note = None
+
+    for day_name, entries in schedule_data.items():
+        if not isinstance(entries, list):
+            continue
+        real_tasks = [e for e in entries if e.get("type") not in ("break", "travel", "shower")]
+        if real_tasks:
+            days_with_tasks += 1
+        total_tasks += len(entries)
+        total_focus += len(real_tasks)
+        total_min += sum(e.get("duration_min", 0) for e in entries)
+        total_checked += sum(
+            1 for i, e in enumerate(entries)
+            if st.session_state.get(_task_key(day_name, e, i), False)
+        )
+        if not weather_note:
+            weather_note = next(
+                (e["weather"] for e in entries if e.get("weather")), None
+            )
+
+    hours, mins = divmod(total_min, 60)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Planned", f"{hours}h {mins}m", delta=f"{total_tasks} blocks")
+    c2.metric("Focus Tasks", str(total_focus), delta=f"across {days_with_tasks} days")
+    c3.metric("Completed", f"{total_checked}/{total_tasks}")
+    if weather_note:
+        c4.metric("Weather", weather_note[:30])
+    else:
+        c4.metric("Weather", "N/A")
+
+
+def render_day_schedule(entries: list, day_name: str, fallback_text: str = ""):
+    """Render a single day's schedule as an interactive checklist."""
     if entries:
         render_day_metrics(entries)
+        render_day_progress(entries, day_name)
         st.markdown("---")
-        for entry in entries:
-            render_card(entry)
+        for i, entry in enumerate(entries):
+            render_task_checkbox(entry, day_name, i)
     elif fallback_text:
         st.markdown(fallback_text)
     else:
@@ -319,28 +276,115 @@ def render_day_schedule(entries: list, fallback_text: str = ""):
 
 
 def render_weekly_schedule(schedule_data: dict, fallback_text: str):
-    """Render the full weekly schedule with tabs per day."""
+    """Render the full weekly schedule with tabs per day and interactive checkboxes."""
     if not schedule_data:
         st.markdown(fallback_text)
         return
 
+    _init_checkbox_states(schedule_data)
+
     render_weekly_metrics(schedule_data)
     st.markdown("---")
 
-    # Create tabs for each day
     day_names = list(schedule_data.keys())
     if not day_names:
         st.markdown(fallback_text)
         return
 
-    tabs = st.tabs(day_names)
+    # Build tab labels with completion counts
+    tab_labels = []
+    for day_name in day_names:
+        entries = schedule_data.get(day_name, [])
+        if isinstance(entries, list) and entries:
+            done = sum(
+                1 for i, e in enumerate(entries)
+                if st.session_state.get(_task_key(day_name, e, i), False)
+            )
+            total = len(entries)
+            if done == total and total > 0:
+                tab_labels.append(f"\u2705 {day_name}")
+            elif done > 0:
+                tab_labels.append(f"{day_name} ({done}/{total})")
+            else:
+                tab_labels.append(day_name)
+        else:
+            tab_labels.append(day_name)
+
+    tabs = st.tabs(tab_labels)
     for tab, day_name in zip(tabs, day_names):
         with tab:
             entries = schedule_data.get(day_name, [])
             if isinstance(entries, list):
-                render_day_schedule(entries)
+                render_day_schedule(entries, day_name)
             else:
                 st.markdown(str(entries))
+
+
+# ---------------------------------------------------------------------------
+# Export helpers — flatten weekly schedule to DataFrame for CSV/Excel download
+# ---------------------------------------------------------------------------
+
+def schedule_to_dataframe(schedule_data: dict) -> pd.DataFrame:
+    """Flatten the weekly schedule dict into a clean, export-ready DataFrame."""
+    rows = []
+    for day_name, entries in schedule_data.items():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            t = TYPE_CONFIG.get(entry.get("type", ""), DEFAULT_TYPE)
+            notes_parts = []
+            if entry.get("notes"):
+                notes_parts.append(entry["notes"])
+            if entry.get("weather"):
+                notes_parts.append(entry["weather"])
+            if entry.get("commute"):
+                notes_parts.append(entry["commute"])
+            rows.append({
+                "Day": day_name,
+                "Start": entry.get("start", ""),
+                "End": entry.get("end", ""),
+                "Task": f"{t['icon']} {entry.get('title', 'Untitled')}",
+                "Type": t["label"],
+                "Priority": entry.get("priority", ""),
+                "Duration (min)": entry.get("duration_min", ""),
+                "Location": entry.get("location", ""),
+                "Notes / Weather": " | ".join(notes_parts) if notes_parts else "",
+            })
+    return pd.DataFrame(rows)
+
+
+def render_export_section(schedule_data: dict):
+    """Render CSV and Excel download buttons for the schedule."""
+    df = schedule_to_dataframe(schedule_data)
+    if df.empty:
+        return
+
+    st.subheader("\U0001f4e5 Export Schedule")
+
+    col_csv, col_xlsx = st.columns(2)
+
+    with col_csv:
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="\U0001f4c4 Download CSV",
+            data=csv_bytes,
+            file_name="AI_Weekly_Schedule.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with col_xlsx:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Weekly Schedule")
+        buf.seek(0)
+        st.download_button(
+            label="\U0001f4ca Download Excel",
+            data=buf.getvalue(),
+            file_name="AI_Weekly_Schedule.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +412,7 @@ def new_session():
     st.session_state.thread_id = f"web-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     st.session_state.user_timezone = "UTC"
     st.session_state.timeline = []
+    _clear_checkbox_states()
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +535,7 @@ if st.session_state.phase == "input":
 
 
 # ===========================================================================
-# Phase: REVIEW — premium HITL interface with weekly tabbed view
+# Phase: REVIEW — interactive checklist with weekly tabbed view
 # ===========================================================================
 
 elif st.session_state.phase == "review":
@@ -512,6 +557,8 @@ elif st.session_state.phase == "review":
     timeline_key = f"{revisions}:{draft_text[:80]}"
     if (not st.session_state.timeline
             or st.session_state.timeline[-1].get("_key") != timeline_key):
+        # New revision arrived — clear old checkbox states and track this version
+        _clear_checkbox_states()
         st.session_state.timeline.append({
             "type": "schedule",
             "_key": timeline_key,
@@ -538,7 +585,7 @@ elif st.session_state.phase == "review":
                     st.text(entry["text"][:400] + "..." if len(entry["text"]) > 400 else entry["text"])
                     st.divider()
 
-    # --- Render latest schedule with premium weekly tabs ---
+    # --- Render latest schedule as interactive checklist ---
     st.subheader(f"Weekly Schedule v{revisions}")
     render_weekly_schedule(structured, draft_text)
 
@@ -590,7 +637,7 @@ elif st.session_state.phase == "review":
 
 
 # ===========================================================================
-# Phase: DONE — final weekly dashboard
+# Phase: DONE — final weekly checklist dashboard
 # ===========================================================================
 
 elif st.session_state.phase == "done":
@@ -610,6 +657,11 @@ elif st.session_state.phase == "done":
             st.markdown(critique)
 
     st.success(f"Weekly schedule complete! Total revisions: {rev_count}")
+
+    # Export buttons
+    if structured:
+        st.divider()
+        render_export_section(structured)
 
     # Revision history
     if len(st.session_state.timeline) > 1:
