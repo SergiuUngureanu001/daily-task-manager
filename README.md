@@ -6,7 +6,7 @@
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.30+-FF4B4B.svg)](https://streamlit.io)
 [![LangGraph](https://img.shields.io/badge/LangGraph-0.2+-00A67E.svg)](https://github.com/langchain-ai/langgraph)
 [![Gemini 2.5 Pro](https://img.shields.io/badge/Gemini-2.5_Pro-4285F4.svg)](https://ai.google.dev/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 
 Built with **LangGraph** for orchestration and **Gemini 2.5 Pro** for reasoning, this is not a simple chatbot wrapper — it is a stateful, multi-node agent graph with tool-calling, a critic loop, and a human-in-the-loop approval gate. The scheduler reasons about physical constraints (commute times, 90-minute focus limits, workload balance across days) and uses real-time weather and route data to place tasks intelligently.
 
@@ -226,8 +226,3 @@ This starts an interactive CLI session with the same HITL interrupt flow.
 9. **Hit "I'm Behind"** if your day goes off-track — the AI compresses remaining tasks and pushes low-priority items to tomorrow.
 10. **Export** the final schedule as CSV or Excel.
 
----
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
