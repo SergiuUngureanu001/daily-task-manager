@@ -15,7 +15,9 @@ from langgraph.types import Command
 from streamlit_autorefresh import st_autorefresh
 
 from graph import build_graph, build_reschedule_graph, DB_PATH
-from nodes import process_uploaded_file, resolve_timezone, _schedule_to_text
+from nodes import (process_uploaded_file, resolve_timezone, _schedule_to_text,
+                    _goal_slug, _build_goal_slug_map, _extract_keywords,
+                    _fuzzy_keyword_overlap)
 import session_store
 
 # ---------------------------------------------------------------------------
@@ -121,6 +123,7 @@ reschedule_app = get_reschedule_app()
 # ---------------------------------------------------------------------------
 
 NODE_LABELS = {
+    "goal_decomposer": "Breaking down long-term goals into weekly tasks...",
     "document_processor": "Processing uploaded documents...",
     "task_ingester": "Analyzing your tasks for the week...",
     "scheduler": "Drafting your weekly schedule...",
@@ -244,8 +247,19 @@ def render_task_checkbox(entry: dict, day_name: str, index: int):
     goal_id = entry.get("goal_id")
     if goal_id is not None:
         goals = st.session_state.get("macro_goals", [])
-        if 0 <= goal_id < len(goals):
-            meta_parts.append(f"\U0001f3af {goals[goal_id]}")
+        if goals:
+            slug_map = _build_goal_slug_map(goals)
+            # Try slug match first, then legacy int index fallback
+            resolved_name = slug_map.get(str(goal_id))
+            if not resolved_name:
+                try:
+                    idx = int(goal_id)
+                    if 0 <= idx < len(goals):
+                        resolved_name = goals[idx]
+                except (ValueError, TypeError):
+                    pass
+            if resolved_name:
+                meta_parts.append(f"\U0001f3af {resolved_name}")
 
     if meta_parts:
         meta_text = " | ".join(meta_parts)
@@ -620,21 +634,54 @@ def run_reschedule(schedule_data: dict, parsed_tasks: list):
 # Macro-Goal Progress rendering
 # ---------------------------------------------------------------------------
 
+def _match_goal_id(entry_gid, slug: str, goal_index: int) -> bool:
+    """Check if an entry's goal_id matches the expected slug or legacy integer index."""
+    if entry_gid is None:
+        return False
+    gid_str = str(entry_gid)
+    # Primary: string slug match
+    if gid_str == slug:
+        return True
+    # Legacy fallback: integer index match (schedules generated before slug refactor)
+    try:
+        if int(entry_gid) == goal_index:
+            return True
+    except (ValueError, TypeError):
+        pass
+    return False
+
+
 def render_goal_progress(schedule_data: dict, macro_goals: list):
-    """Render progress bars for each weekly macro-goal."""
+    """Render progress bars for each weekly macro-goal using string slug IDs."""
     if not macro_goals or not schedule_data:
         return
 
     st.subheader("\U0001f3af Weekly Goal Progress")
 
-    for goal_idx, goal_name in enumerate(macro_goals):
+    slug_map = _build_goal_slug_map(macro_goals)
+
+    goal_kw_cache = {slug: _extract_keywords(gname) for slug, gname in slug_map.items()}
+
+    for goal_index, (slug, goal_name) in enumerate(slug_map.items()):
         total = 0
         done = 0
+        goal_kw = goal_kw_cache[slug]
         for day_name, entries in schedule_data.items():
             if not isinstance(entries, list):
                 continue
             for i, entry in enumerate(entries):
-                if entry.get("goal_id") == goal_idx:
+                matched = False
+                # Primary: goal_id field match (slug or legacy int)
+                if _match_goal_id(entry.get("goal_id"), slug, goal_index):
+                    matched = True
+                elif entry.get("type") not in ("break", "travel", "meal", "shower"):
+                    # Fallback: fuzzy keyword match against title
+                    title_kw = _extract_keywords(entry.get("title", ""))
+                    if goal_kw and title_kw:
+                        overlap = _fuzzy_keyword_overlap(goal_kw, title_kw)
+                        if overlap >= 1:
+                            matched = True
+                if matched:
                     total += 1
                     key = _task_key(day_name, entry, i)
                     if st.session_state.get(key, False):
@@ -645,6 +692,83 @@ def render_goal_progress(schedule_data: dict, macro_goals: list):
             st.progress(pct, text=f"**{goal_name}** \u2014 {done}/{total} tasks ({int(pct*100)}%)")
         else:
             st.progress(0.0, text=f"**{goal_name}** \u2014 No linked tasks found")
+
+
+def render_long_term_goal_progress(schedule_data: dict):
+    """
+    Render persistent progress bars for long-term goals from the database.
+    Shows total hours completed vs estimated, and updates hours_completed
+    based on checked-off schedule entries that match the goal.
+    """
+    goals = session_store.list_goals(status="active")
+    if not goals:
+        return
+
+    st.subheader("\U0001f3af Long-Term Goal Progress")
+
+    for g in goals:
+        total_h = g["total_hours_estimated"]
+        completed_h = g["hours_completed"]
+        remaining_h = max(0, total_h - completed_h)
+
+        # Count checked-off minutes from this week's schedule for this goal
+        weekly_done_min = 0
+        weekly_total_min = 0
+        if schedule_data:
+            # Generate the slug for this goal to match against schedule entries
+            goal_slug = _goal_slug(g["goal_name"])
+            goal_name_lower = g["goal_name"].lower()
+            for day_name, entries in schedule_data.items():
+                if not isinstance(entries, list):
+                    continue
+                for i, entry in enumerate(entries):
+                    if not isinstance(entry, dict):
+                        continue
+                    # Match entry to this long-term goal
+                    entry_gid = entry.get("goal_id")
+                    matched = False
+                    if entry_gid is not None:
+                        # String slug match
+                        if str(entry_gid) == goal_slug:
+                            matched = True
+                    if not matched and entry.get("type") not in ("break", "travel", "meal", "shower"):
+                        # Fallback: fuzzy keyword matching against title
+                        title = entry.get("title", "").lower()
+                        goal_kw = _extract_keywords(goal_name_lower)
+                        title_kw = _extract_keywords(title)
+                        if goal_kw and title_kw:
+                            overlap = _fuzzy_keyword_overlap(goal_kw, title_kw)
+                            if overlap >= 1:
+                                matched = True
+                    if matched:
+                        dur = entry.get("duration_min", 0)
+                        weekly_total_min += dur
+                        key = _task_key(day_name, entry, i)
+                        if st.session_state.get(key, False):
+                            weekly_done_min += dur
+
+        # Calculate effective progress
+        effective_h = completed_h + (weekly_done_min / 60)
+        pct = min(1.0, effective_h / total_h) if total_h > 0 else 0
+
+        try:
+            deadline = datetime.strptime(g["deadline_date"], "%Y-%m-%d").date()
+            days_left = (deadline - datetime.utcnow().date()).days
+        except (ValueError, TypeError):
+            days_left = -1
+
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            st.progress(
+                pct,
+                text=(
+                    f"**{g['goal_name']}** \u2014 {effective_h:.1f}/{total_h}h "
+                    f"({int(pct*100)}%) \u2022 {days_left}d left"
+                ),
+            )
+        with col2:
+            if weekly_done_min > 0:
+                st.caption(f"+{weekly_done_min}min this week")
 
 
 # ---------------------------------------------------------------------------
@@ -729,8 +853,16 @@ def schedule_to_dataframe(schedule_data: dict) -> pd.DataFrame:
             goal_id = entry.get("goal_id")
             if goal_id is not None:
                 goals = st.session_state.get("macro_goals", [])
-                if 0 <= goal_id < len(goals):
-                    goal_name = goals[goal_id]
+                if goals:
+                    slug_map = _build_goal_slug_map(goals)
+                    goal_name = slug_map.get(str(goal_id), "")
+                    if not goal_name:
+                        try:
+                            idx = int(goal_id)
+                            if 0 <= idx < len(goals):
+                                goal_name = goals[idx]
+                        except (ValueError, TypeError):
+                            pass
             rows.append({
                 "Day": day_name,
                 "Start": entry.get("start", ""),
@@ -778,6 +910,292 @@ def render_export_section(schedule_data: dict):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Template Manager UI
+# ---------------------------------------------------------------------------
+
+def render_template_manager():
+    """Render the template management UI inside an expander."""
+    st.subheader("\U0001f4da Template Manager")
+    st.caption("Save recurring weekly schedules (e.g. university classes) and load them each week.")
+
+    # --- Existing templates ---
+    templates = session_store.list_templates()
+    if templates:
+        for tmpl in templates:
+            with st.expander(f"\U0001f4c4 {tmpl['name']} ({len(tmpl['tasks'])} tasks)", expanded=False):
+                for t in tmpl["tasks"]:
+                    days = ", ".join(t.get("recurrence_days", [])) if t.get("is_recurring") else (t.get("preferred_day") or "flexible")
+                    st.caption(
+                        f"**{t.get('task', 'Untitled')}** | "
+                        f"{t.get('duration', '?')}min | "
+                        f"{days}"
+                        + (f" | {t.get('deadline', '')}" if t.get("deadline") else "")
+                        + (f" | {t.get('location', '')}" if t.get("location") else "")
+                    )
+                if st.button(f"Delete \"{tmpl['name']}\"", key=f"del_tmpl_{tmpl['id']}"):
+                    session_store.delete_template(tmpl["name"])
+                    st.rerun()
+    else:
+        st.info("No templates saved yet. Create one below.")
+
+    st.markdown("---")
+
+    # --- Create new template ---
+    st.markdown("**Create New Template**")
+
+    new_name = st.text_input("Template name", placeholder="e.g. University Semester 2", key="new_tmpl_name")
+
+    create_method = st.radio(
+        "How to add tasks?",
+        ["Type manually", "Upload CSV/JSON"],
+        horizontal=True,
+        key="tmpl_create_method",
+    )
+
+    if create_method == "Type manually":
+        st.caption(
+            "Enter one task per line: `Task Name | Day | Time | Duration(min) | Location`\n\n"
+            "Example: `Calculus II | Monday | 10:00 | 90 | Room 301, Faculty of Math`"
+        )
+        tasks_text = st.text_area(
+            "Tasks (one per line)",
+            height=150,
+            key="tmpl_tasks_text",
+            placeholder="Calculus II | Monday | 10:00 | 90 | Room 301\nPhysics Lab | Wednesday | 14:00 | 120 | Lab B2",
+        )
+        if st.button("Save Template", type="primary", key="save_tmpl_manual") and new_name.strip() and tasks_text.strip():
+            tasks = _parse_template_text(tasks_text)
+            if tasks:
+                session_store.save_template(new_name.strip(), tasks)
+                st.success(f"Template \"{new_name.strip()}\" saved with {len(tasks)} tasks!")
+                st.rerun()
+            else:
+                st.error("Could not parse any tasks. Use format: Task | Day | Time | Duration | Location")
+
+    else:  # Upload CSV/JSON
+        uploaded = st.file_uploader(
+            "Upload a CSV or JSON file",
+            type=["csv", "json"],
+            key="tmpl_upload",
+        )
+        if uploaded and new_name.strip():
+            if st.button("Save Template", type="primary", key="save_tmpl_upload"):
+                tasks = _parse_template_upload(uploaded)
+                if tasks:
+                    session_store.save_template(new_name.strip(), tasks)
+                    st.success(f"Template \"{new_name.strip()}\" saved with {len(tasks)} tasks!")
+                    st.rerun()
+                else:
+                    st.error("Could not parse tasks from uploaded file.")
+
+
+def _parse_template_text(text: str) -> list[dict]:
+    """Parse pipe-delimited text lines into template task dicts."""
+    tasks = []
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 2:
+            continue
+        task_name = parts[0]
+        day = parts[1] if len(parts) > 1 else None
+        time_str = parts[2] if len(parts) > 2 else None
+        duration = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 60
+        location = parts[4] if len(parts) > 4 else None
+
+        # Detect recurring: if day contains "/" or ","
+        is_recurring = False
+        recurrence_days = []
+        preferred_day = None
+        if day and ("/" in day or "," in day):
+            is_recurring = True
+            recurrence_days = [d.strip().title() for d in day.replace("/", ",").split(",")]
+        elif day:
+            preferred_day = day.strip().title()
+
+        tasks.append({
+            "task": task_name,
+            "duration": duration,
+            "priority": 1,
+            "deadline": time_str,
+            "location": location,
+            "preferred_day": preferred_day,
+            "is_recurring": is_recurring,
+            "recurrence_days": recurrence_days,
+            "date_deadline": None,
+        })
+    return tasks
+
+
+def _parse_template_upload(uploaded_file) -> list[dict]:
+    """Parse an uploaded CSV or JSON file into template task dicts."""
+    name = uploaded_file.name.lower()
+    raw = uploaded_file.read()
+
+    if name.endswith(".json"):
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            if isinstance(data, list):
+                # Validate each entry has at least a "task" key
+                return [d for d in data if isinstance(d, dict) and "task" in d]
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return []
+
+    elif name.endswith(".csv"):
+        try:
+            import io as _io
+            df = pd.read_csv(_io.BytesIO(raw))
+            tasks = []
+            for _, row in df.iterrows():
+                r = row.to_dict()
+                task_name = r.get("task") or r.get("Task") or r.get("name") or r.get("Name")
+                if not task_name:
+                    continue
+                day = r.get("day") or r.get("Day") or r.get("preferred_day")
+                is_recurring = False
+                recurrence_days = []
+                preferred_day = None
+                if day and ("/" in str(day) or "," in str(day)):
+                    is_recurring = True
+                    recurrence_days = [d.strip().title() for d in str(day).replace("/", ",").split(",")]
+                elif day:
+                    preferred_day = str(day).strip().title()
+
+                tasks.append({
+                    "task": str(task_name),
+                    "duration": int(r.get("duration") or r.get("Duration") or 60),
+                    "priority": int(r.get("priority") or r.get("Priority") or 1),
+                    "deadline": str(r.get("time") or r.get("Time") or r.get("deadline") or "") or None,
+                    "location": str(r.get("location") or r.get("Location") or "") or None,
+                    "preferred_day": preferred_day,
+                    "is_recurring": is_recurring,
+                    "recurrence_days": recurrence_days,
+                    "date_deadline": None,
+                })
+            return tasks
+        except Exception:
+            return []
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Goal Dashboard UI
+# ---------------------------------------------------------------------------
+
+def render_goal_dashboard():
+    """Render the long-term goal management UI."""
+    st.subheader("\U0001f3af Long-Term Goals")
+    st.caption(
+        "Add long-term goals with deadlines. The AI will automatically "
+        "break them into weekly chunks each time you plan."
+    )
+
+    # --- Existing goals ---
+    goals = session_store.list_goals(status=None)
+    if goals:
+        for g in goals:
+            try:
+                deadline = datetime.strptime(g["deadline_date"], "%Y-%m-%d").date()
+                days_left = (deadline - datetime.utcnow().date()).days
+                weeks_left = max(0, days_left // 7)
+            except (ValueError, TypeError):
+                days_left = -1
+                weeks_left = 0
+
+            pct = (g["hours_completed"] / g["total_hours_estimated"] * 100
+                   if g["total_hours_estimated"] > 0 else 0)
+
+            status_icon = {
+                "active": "\U0001f7e2",
+                "completed": "\u2705",
+                "paused": "\u23f8\ufe0f",
+                "cancelled": "\u274c",
+            }.get(g["status"], "\u2753")
+
+            with st.expander(
+                f"{status_icon} {g['goal_name']} \u2014 {g['deadline_date']} "
+                f"({weeks_left}w left, {pct:.0f}%)",
+                expanded=False,
+            ):
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Total Hours", f"{g['total_hours_estimated']}h")
+                col2.metric("Completed", f"{g['hours_completed']}h")
+                col3.metric("Remaining", f"{max(0, g['total_hours_estimated'] - g['hours_completed']):.1f}h")
+
+                if g["total_hours_estimated"] > 0:
+                    st.progress(min(1.0, g["hours_completed"] / g["total_hours_estimated"]))
+
+                # Update controls
+                up_col1, up_col2 = st.columns(2)
+                with up_col1:
+                    new_hours = st.number_input(
+                        "Log hours completed",
+                        min_value=0.0,
+                        value=float(g["hours_completed"]),
+                        step=0.5,
+                        key=f"goal_hours_{g['id']}",
+                    )
+                    if new_hours != g["hours_completed"]:
+                        session_store.update_goal(g["id"], hours_completed=new_hours)
+                        st.rerun()
+
+                with up_col2:
+                    new_status = st.selectbox(
+                        "Status",
+                        ["active", "completed", "paused", "cancelled"],
+                        index=["active", "completed", "paused", "cancelled"].index(g["status"]),
+                        key=f"goal_status_{g['id']}",
+                    )
+                    if new_status != g["status"]:
+                        session_store.update_goal(g["id"], status=new_status)
+                        st.rerun()
+
+                if st.button("Delete Goal", key=f"del_goal_{g['id']}"):
+                    session_store.delete_goal(g["id"])
+                    st.rerun()
+    else:
+        st.info("No long-term goals yet. Add one below.")
+
+    st.markdown("---")
+
+    # --- Add new goal ---
+    st.markdown("**Add New Goal**")
+    gcol1, gcol2 = st.columns(2)
+    with gcol1:
+        goal_name = st.text_input(
+            "Goal name",
+            placeholder="e.g. Write Bachelor's Thesis",
+            key="new_goal_name",
+        )
+    with gcol2:
+        goal_deadline = st.date_input(
+            "Deadline",
+            value=datetime.utcnow().date() + timedelta(days=60),
+            key="new_goal_deadline",
+        )
+
+    goal_hours = st.number_input(
+        "Estimated total effort (hours)",
+        min_value=1.0,
+        value=40.0,
+        step=5.0,
+        key="new_goal_hours",
+    )
+
+    if st.button("Add Goal", type="primary", key="add_goal_btn") and goal_name.strip():
+        session_store.save_goal(
+            goal_name=goal_name.strip(),
+            deadline_date=goal_deadline.strftime("%Y-%m-%d"),
+            total_hours=goal_hours,
+        )
+        st.success(f"Goal \"{goal_name.strip()}\" added!")
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -937,6 +1355,15 @@ with st.sidebar:
             if not is_current:
                 st.caption(date_str)
 
+    # --- Template & Goal Management ---
+    st.divider()
+    with st.expander("\U0001f4da Templates & Goals", expanded=False):
+        mgr_tab1, mgr_tab2 = st.tabs(["\U0001f4da Templates", "\U0001f3af Goals"])
+        with mgr_tab1:
+            render_template_manager()
+        with mgr_tab2:
+            render_goal_dashboard()
+
     st.divider()
     st.caption("Powered by Gemini 2.5 Pro + LangGraph")
     st.caption(f"Session: `{st.session_state.thread_id}`")
@@ -981,16 +1408,44 @@ def run_graph_streaming(inputs, config, *, is_resume=False):
 # ===========================================================================
 
 if st.session_state.phase == "input":
-    st.subheader("What do you need to get done this week?")
+    # --- Step 1: Base Template (recurring weekly tasks) ---
+    st.subheader("\U0001f4da Base Template")
+    st.caption("Start from a saved template with your recurring weekly tasks (e.g. university classes).")
+    templates = session_store.list_templates()
+    template_names = ["None — start from scratch"] + [
+        f"{t['name']} ({len(t['tasks'])} tasks)" for t in templates
+    ]
+    selected_idx = st.selectbox(
+        "Select Base Template",
+        range(len(template_names)),
+        format_func=lambda i: template_names[i],
+        index=0,
+        key="input_base_template",
+    )
+    selected_template_tasks = []
+    if selected_idx > 0:
+        tmpl = templates[selected_idx - 1]
+        selected_template_tasks = tmpl["tasks"]
+        with st.expander(f"Template: **{tmpl['name']}** — {len(selected_template_tasks)} recurring tasks loaded", expanded=False):
+            for t in selected_template_tasks:
+                days = ", ".join(t.get("recurrence_days", [])) if t.get("is_recurring") else (t.get("preferred_day") or "flexible")
+                st.caption(f"**{t.get('task', 'Untitled')}** — {days} | {t.get('duration', '?')}min")
 
+    # --- Step 2: Additional ad-hoc tasks ---
+    st.subheader("Additional Tasks" if selected_template_tasks else "What do you need to get done this week?")
+    if selected_template_tasks:
+        st.caption("Add any one-off tasks for this specific week (appointments, deadlines, errands, etc.).")
     raw_tasks = st.text_area(
-        "Type your tasks (natural language is fine!)",
+        "Extra tasks for this week (natural language is fine!)" if selected_template_tasks
+        else "Type your tasks (natural language is fine!)",
         placeholder=(
+            "e.g., Dentist Tuesday 10am, finish project report by Thursday, buy groceries"
+            if selected_template_tasks else
             "e.g., Finish project report by Thursday, gym Mon/Wed/Fri at 6pm, "
             "dentist appointment Tuesday 10am, groceries, call mom, "
             "study for exam on Saturday"
         ),
-        height=140,
+        height=100 if selected_template_tasks else 140,
     )
 
     uploaded_files = st.file_uploader(
@@ -999,7 +1454,7 @@ if st.session_state.phase == "input":
         type=["txt", "pdf", "png", "jpg", "jpeg"],
     )
 
-    # --- Macro-Goals input ---
+    # --- Step 3: Macro-Goals ---
     st.subheader("\U0001f3af Weekly Goals (optional)")
     st.caption("Set 1-3 macro-goals to track progress across the week.")
     goal_cols = st.columns(3)
@@ -1016,7 +1471,7 @@ if st.session_state.phase == "input":
             if g.strip():
                 macro_goals.append(g.strip())
 
-    can_submit = bool(raw_tasks and raw_tasks.strip()) or bool(uploaded_files)
+    can_submit = bool(raw_tasks and raw_tasks.strip()) or bool(uploaded_files) or bool(selected_template_tasks)
 
     if st.button("Plan My Week", type="primary", disabled=not can_submit):
         # Save macro goals to session state
@@ -1052,11 +1507,14 @@ if st.session_state.phase == "input":
 
         # Step 4: invoke the graph
         initial_state = {
-            "raw_tasks": raw_tasks or "See uploaded documents below.",
+            "raw_tasks": raw_tasks or ("See uploaded documents and/or template tasks below."
+                                       if (extracted_text or selected_template_tasks)
+                                       else "No additional tasks."),
             "user_location": st.session_state.location,
             "user_timezone": user_tz,
             "uploaded_files_text": extracted_text,
             "macro_goals": macro_goals,
+            "template_tasks": selected_template_tasks,
         }
 
         config = get_config()
@@ -1104,6 +1562,10 @@ elif st.session_state.phase == "review":
     # --- Goal Progress (if goals set) ---
     if st.session_state.macro_goals and structured:
         render_goal_progress(structured, st.session_state.macro_goals)
+    # --- Long-term goal progress (always shown if active goals exist) ---
+    if structured:
+        render_long_term_goal_progress(structured)
+    if (st.session_state.macro_goals and structured) or structured:
         st.markdown("---")
 
     # --- Render previous timeline entries (collapsed) ---
@@ -1257,6 +1719,10 @@ elif st.session_state.phase == "done":
     # --- Goal Progress ---
     if st.session_state.macro_goals and structured:
         render_goal_progress(structured, st.session_state.macro_goals)
+    # --- Long-term goal progress (persistent) ---
+    if structured:
+        render_long_term_goal_progress(structured)
+    if structured:
         st.markdown("---")
 
     # --- Main schedule view (Focus Mode or Full Calendar) ---
@@ -1343,6 +1809,9 @@ elif st.session_state.phase == "history":
     if goals and structured:
         st.session_state.macro_goals = goals
         render_goal_progress(structured, goals)
+    if structured:
+        render_long_term_goal_progress(structured)
+    if structured:
         st.markdown("---")
 
     st.subheader("\U0001f4c2 Past Schedule")

@@ -8,6 +8,7 @@ from langgraph.types import Command
 
 from state import SchedulerState, RescheduleState
 from nodes import (
+    goal_decomposer,
     document_processor,
     task_ingester,
     scheduler,
@@ -78,6 +79,7 @@ def build_graph(sqlite_conn=None):
     workflow = StateGraph(SchedulerState)
 
     # Register all nodes
+    workflow.add_node("goal_decomposer", goal_decomposer)
     workflow.add_node("document_processor", document_processor)
     workflow.add_node("task_ingester", task_ingester)
     workflow.add_node("scheduler", scheduler)
@@ -85,8 +87,9 @@ def build_graph(sqlite_conn=None):
     workflow.add_node("critic", critic)
     workflow.add_node("human_review", human_review)
 
-    # Fixed edges
-    workflow.add_edge(START, "document_processor")
+    # Fixed edges: goal_decomposer -> document_processor -> task_ingester -> ...
+    workflow.add_edge(START, "goal_decomposer")
+    workflow.add_edge("goal_decomposer", "document_processor")
     workflow.add_edge("document_processor", "task_ingester")
     workflow.add_edge("task_ingester", "scheduler")
     workflow.add_edge("tools", "scheduler")  # Tool results feed back into Scheduler
